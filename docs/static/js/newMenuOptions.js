@@ -286,7 +286,8 @@ display_settings = () => {
     document.getElementById("fullScreenEditorForInputs").checked = localsettings.fullScreenEditorForInputs;
     document.getElementById("corpoHideLeftPanel").checked = localsettings.corpoHideLeftPanel;
     document.getElementById("agentSavedMacros").value = JSON.stringify(localsettings?.agentSavedMacros || window.eso.agentMacros, null, 2)
-    document.getElementById("contextContentPadding").value = localsettings.contextContentPadding;
+    document.getElementById("turnsMaxContent").value = localsettings.turnsMaxContent;
+    document.getElementById("turnsOldContentRatio").value = localsettings.turnsOldContentRatio;
     document.getElementById("hearthfireContext").checked = !!localsettings.hearthfireContext;
     renderEsoboldAgentTools()
     window.updateLumaraListenerStatusIndicator()
@@ -330,7 +331,8 @@ confirm_settings = () => {
     localsettings.showContextUsageChart = (document.getElementById("showContextUsageChart").checked ? true : false);
     localsettings.fullScreenEditorForInputs = (document.getElementById("fullScreenEditorForInputs").checked ? true : false);
     localsettings.corpoHideLeftPanel = (document.getElementById("corpoHideLeftPanel").checked ? true : false);
-    localsettings.contextContentPadding = document.getElementById("contextContentPadding").value;
+    localsettings.turnsMaxContent = document.getElementById("turnsMaxContent").value;
+    localsettings.turnsOldContentRatio = document.getElementById("turnsOldContentRatio").value;
     localsettings.hearthfireContext = (document.getElementById("hearthfireContext").checked ? true : false);
     try
     {
@@ -465,8 +467,11 @@ window.addEventListener('load', () => {
     if (localsettings?.lastMessageProcessedFromLumara == undefined) {
         localsettings.lastMessageProcessedFromLumara = 0
     }
-    if (localsettings?.contextContentPadding == undefined) {
-        localsettings.contextContentPadding = 0
+    if (localsettings?.turnsMaxContent == undefined) {
+        localsettings.turnsMaxContent = 0
+    }
+    if (localsettings?.turnsOldContentRatio == undefined) {
+        localsettings.turnsOldContentRatio = 0.5
     }
     if (localsettings?.hearthfireContext == undefined) {
         localsettings.hearthfireContext = false
@@ -801,7 +806,10 @@ window.addEventListener('load', () => {
 
     settingsBox.appendChild(createNewSubSection("Context settings", false))
 
-    settingLabelElem = createSettingElemRange("contextContentPadding", "Context content padding", "The max context defines the entire window the AI can see. The padding defines an amount of context which is held back to reduces full regeneration of the context when using models which cannot shift (such as RNN). Mostly helpful on large MOEs.", 0, 131072, 1024, 0)
+    settingLabelElem = createSettingElemRange("turnsMaxContent", "Turns max content", "The maximum amount tokens allowed for user and AI turns. Enabling this option will create a sliding window. With smaller models this is often not needed as the prompt processing speed is high, but can be useful for larger models. Please note, the amount selected here should be your total possible context minus the amount you expect to be used for memory, world info, authors note, system prompt etc as a maximum.", 0, 131072, 1024, 0)
+    settingsBox.append(settingLabelElem)
+
+    settingLabelElem = createSettingElemRange("turnsOldContentRatio", "Turns old content ratio", "The ratio of old content to retain within the sliding window.", 0, 1, 0.05, 0.6)
     settingsBox.append(settingLabelElem)
 
     settingLabelElem = createSettingElemBool("hearthfireContext", "Hearthfire context", "When this flag is set to true, after a user gets a reply another request will be automatically triggered. The second request preps the context for future interactions which should reduce the wait time (essentially prompt processing while you start to type your reply).")
