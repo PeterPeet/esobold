@@ -15,52 +15,41 @@ window.alias = (func, before, after) => {
 
 let getHashForContext = () => cyrb_hash(concat_gametext(true), 0, 8);
 
-let intervalId = null, previousContentHash;
-let startHearthfireTimer = () => {
+let previousContentHash;
+let triggerHearthfireRequest = () => {
     if (localsettings.hearthfireContext) {
-        console.log("Evaluating if hearthfire context should start");
-        setTimeout(() => {
-            let currentContentHash = getHashForContext();
-            let hasContentChanged = currentContentHash !== previousContentHash;
-            previousContentHash = currentContentHash;
-            if (hasContentChanged && intervalId == null) {
-                console.log("Content changed, starting Hearthfire timer to check for when it is safe to submit");
-                intervalId = setInterval(() => {
-                    if (!checkForPendingRequest() && !isEditModeActive()) {
-                        clearInterval(intervalId);
-                        intervalId = null;
-
-                        console.log("Hearthfire timer triggered, submitting");
-                        // Temporarily override the submit length
-                        let og_finalize_submit_payload = finalize_submit_payload;
-                        finalize_submit_payload = alias((submit_payload) => {
-                            if (submit_payload && submit_payload.params) {
-                                submit_payload.params.max_length = 1;
-                            }
-                            return submit_payload;
-                        }, undefined, startHearthfireTimer);
-
-                        // Trigger warmup request here
-                        submit_generation("").then(() => {
-                            // Reset the override
-                            finalize_submit_payload = og_finalize_submit_payload;
-                            console.log("Hearthfire timer finished");
-                        })
+        let currentContentHash = getHashForContext();
+        let hasContentChanged = currentContentHash !== previousContentHash;
+        previousContentHash = currentContentHash;
+        if (hasContentChanged) {
+            console.log("Content has changed, triggering Hearthfire request");
+            try
+            {
+                window.hearthfireGenActive = true;
+                // Temporarily override the submit length
+                let og_finalize_submit_payload = finalize_submit_payload;
+                finalize_submit_payload = alias((submit_payload) => {
+                    if (submit_payload && submit_payload.params) {
+                        submit_payload.params.max_length = 1;
                     }
-                }, 1000);
+                    return submit_payload;
+                }, undefined, startHearthfireTimer);
+
+                // Trigger warmup request here
+                submit_generation("").then(() => {
+                    // Reset the override
+                    finalize_submit_payload = og_finalize_submit_payload;
+                    console.log("Hearthfire request finished");
+                })
             }
-            else {
-                console.log("Content has not changed, Hearthfire timer not started");
+            catch(e)
+            {
+                console.error("Error during Hearthfire request:", e);
             }
-        }, 10000)
-    }
-    else if (intervalId != null) {
-        clearInterval(intervalId);
-        intervalId = null;
+            finally
+            {
+                window.hearthfireGenActive = false;
+            }
+        }
     }
 }
-
-window.addEventListener("load", () => {
-    window.merge_edit_field = alias(merge_edit_field, undefined, startHearthfireTimer)
-    window.prepare_submit_generation = alias(prepare_submit_generation, undefined, startHearthfireTimer)
-});

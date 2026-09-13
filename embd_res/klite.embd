@@ -21580,7 +21580,7 @@ Current version indicated by LITEVER below.
 				}
 			}
 
-			if (newgen != "") {
+			if (newgen != "" && !window?.hearthfireGenActive) {
 				gametext_arr.push(newgen);
 			}
 			redo_arr = [];
@@ -21721,25 +21721,24 @@ Current version indicated by LITEVER below.
 			 * 5. Split the truncated context at the determined split point. */
 			truncated_context = `${current_temp_memory}${truncated_context}`;
 			contextUsage.setUsage("tempMemory", current_temp_memory.length);
-			let contextContentPadding = Number(localsettings.contextContentPadding)
-			if (contextContentPadding !== 0) {
+			let turnsMaxContent = Number(localsettings.turnsMaxContent)
+			let turnsOldContentRatio = Number(localsettings.turnsOldContentRatio)
+			if (turnsMaxContent !== 0 && turnsOldContentRatio !== 0) {
 				let charactersPerToken = getCharactersPerToken(truncated_context)
-				let charactersForPadding = contextContentPadding * charactersPerToken;
-				let splitPointInterval = charactersForPadding;
+				let maxCharactersForTurns = turnsMaxContent * charactersPerToken;
+				let splitPointInterval = maxCharactersForTurns * (1 - turnsOldContentRatio);
 				let contentLength = truncated_context.length
-				let thresholdForLegalSplit = 0.4 * max_allowed_characters;
+				let thresholdForLegalSplit = maxCharactersForTurns * turnsOldContentRatio;
 				
 				let splitPoint = 0;
-				if (contentLength > splitPointInterval) {
-					let possibleSplits = []
-					for (let i = 0; i < contentLength; i = i + splitPointInterval) {
-						possibleSplits.push(i)
-					}
-					for (let i = possibleSplits.length - 1; i >= 0; --i) {
-						let potentialSplitPoint = possibleSplits[i];
+				if (splitPointInterval !== 0 && contentLength > maxCharactersForTurns) {
+					
+					let firstSplitPointToCheck = Math.floor(contentLength / splitPointInterval) * splitPointInterval;
+					for (let i = firstSplitPointToCheck; i >= 0; i -= splitPointInterval) {
+						let potentialSplitPoint = i;
+						// Find the left over content after the split, and check if it is above the threshold
 						let distanceToEnd = contentLength - potentialSplitPoint;
-						let charactersLeftAfterSplit = max_allowed_characters - distanceToEnd;
-						if (charactersLeftAfterSplit >= thresholdForLegalSplit) {
+						if (distanceToEnd >= thresholdForLegalSplit) {
 							splitPoint = potentialSplitPoint;
 							break;
 						}
@@ -24925,7 +24924,7 @@ Current version indicated by LITEVER below.
 			}
 		}
 
-		if(gentxt!="")
+		if(gentxt!="" && !window?.hearthfireGenActive)
 		{
 			gametext_arr.push(gentxt); //delete last message if retry is hit, since response was added
 			retry_preserve_last = false;
@@ -35503,5 +35502,6 @@ Current version indicated by LITEVER below.
 <script src="static/js/webContainer.js" type="module"></script>
 <script src="static/js/webContainerUtils.js"></script>
 <script src="static/js/hearthfireContext.js"></script>
+<script src="static/js/postSubmitHandler.js"></script>
 <!-- EsoLite modifications end -->
 </html>
