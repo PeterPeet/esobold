@@ -211,17 +211,6 @@ submit_multiplayer = (fullUpdate) => {
     submitMultiplayerRef(fullUpdate)
 }
 
-let lastPendingResponse = null, waitingForCompletion = false
-setInterval(() => {
-    if (waitingForCompletion && !pending_response_id) {
-        treeHandler.addTreeBranch(concat_gametext())
-        waitingForCompletion = false
-    }
-    else if (!!pending_response_id && !waitingForCompletion) {
-        waitingForCompletion = true
-    }
-}, 1000)
-
 mermaid.initialize({
     maxTextSize: 100000,
     maxEdges: 100000
