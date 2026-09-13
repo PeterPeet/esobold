@@ -112,8 +112,8 @@ musicName = None
 imageName = None
 mmprojName = None
 lastgeneratedcomfyimg = b''
-lastgeneratedcachedimg = b''
-lastgeneratedcachedimgkey = b''
+lastgeneratedcachedpayload = b''
+lastgeneratedcachedpayloadkey = ''
 currgenimgkey = ''
 lastuploadedcomfyimg = b''
 fullsdmodelpath = ""  #if empty, it's not initialized
@@ -132,6 +132,8 @@ maxctx = default_maxctx
 maxhordectx = 0 #set to whatever maxctx is if 0
 maxhordelen = 1024
 modelbusy = threading.Lock()
+token_count_lock = threading.Lock()
+detokenize_lock = threading.Lock()
 batched_lock = threading.Lock()
 batched_cond = threading.Condition(batched_lock)
 batched_request_runner_count = 0 #incremented when a batched request is running, prevents all non-batched requests
@@ -351,6 +353,7 @@ class load_model_inputs(ctypes.Structure):
                 ("overridenativecontext", ctypes.c_int),
                 ("moe_experts", ctypes.c_int),
                 ("moecpu", ctypes.c_int),
+                ("ffncpu", ctypes.c_int),
                 ("no_bos_token", ctypes.c_bool),
                 ("load_guidance", ctypes.c_bool),
                 ("override_kv", ctypes.c_char_p * overridekv_max),
@@ -1721,6 +1724,42 @@ def dump_gguf_metadata(file_path): #if you're gonna copy this into your own proj
         print(f"Error Analyzing File: {e}")
         return
 
+def dump_safetensors_metadata(file_path):
+    with open(file_path, 'rb') as f:
+        size_bytes = f.read(8)
+        if len(size_bytes) != 8:
+            raise ValueError("Safetensors file is too small to contain a header.")
+        header_size = struct.unpack('<Q', size_bytes)[0]
+        # Bound the allocation before reading the JSON header. Tensor data is never read.
+        if header_size > 100_000_000:
+            raise ValueError("Safetensors header exceeds the 100 MB limit.")
+        if header_size < 2 or header_size > os.fstat(f.fileno()).st_size - 8:
+            raise ValueError("Invalid safetensors header length.")
+        header_bytes = f.read(header_size)
+        if len(header_bytes) != header_size:
+            raise ValueError("Truncated safetensors header.")
+        if not header_bytes.startswith(b'{'):
+            raise ValueError("Safetensors header must start with a JSON object.")
+        header = json.loads(header_bytes.decode('utf-8'))
+
+    metadata = header.pop('__metadata__', {})
+    if not isinstance(metadata, dict) or any(not isinstance(v, str) for v in metadata.values()):
+        raise ValueError("Invalid safetensors metadata: expected string values.")
+    for name, tensor in header.items():
+        if not isinstance(tensor, dict) or not isinstance(tensor.get('dtype'), str):
+            raise ValueError(f"Invalid safetensors tensor descriptor: {name}")
+        shape = tensor.get('shape')
+        if not isinstance(shape, list) or any(type(d) is not int or d < 0 for d in shape):
+            raise ValueError(f"Invalid safetensors tensor shape: {name}")
+
+    print(f"*** SAFETENSORS FILE METADATA ***\nSafetensors.tensor_count = {len(header)}\nSafetensors.kv_count = {len(metadata)}")
+    for key, value in metadata.items():
+        print(f"str: {key} = {value}")
+    print("\n*** SAFETENSORS TENSOR INFO ***")
+    for kn, (name, tensor) in enumerate(header.items()):
+        print(f"{kn:<3}: {tensor['dtype']:<8} | {name:<30} | {tensor['shape']}")
+    print(f"Metadata and TensorInfo Bytes: {8 + header_size}")
+
 def read_gguf_metadata(file_path):
     chunk_size = 16384  # read only first 16kb of file
     try:
@@ -2162,6 +2201,7 @@ def load_model(model_filename):
             inputs.override_kv[n] = okv[n].encode("UTF-8")
     inputs.override_tensors = args.overridetensors.encode("UTF-8") if args.overridetensors else "".encode("UTF-8")
     inputs.moecpu = (200 if args.moecpu > 200 else args.moecpu)
+    inputs.ffncpu = (200 if args.ffncpu > 200 else args.ffncpu)
     inputs.check_slowness = (not args.highpriority and os.name == 'nt' and 'Intel' in platform.processor())
     inputs.jinja_template = preloaded_custom_jinja.encode("UTF-8")
     inputs.highpriority = args.highpriority
@@ -4006,14 +4046,16 @@ def music_generate_audio(genparams):
     return outstr
 
 def tokenize_ids(countprompt,tcaddspecial):
-    rawcountdata = handle.token_count(countprompt.encode("UTF-8"),tcaddspecial)
-    count = rawcountdata.count
-    hardlimit = (2**31) - 1
-    countlimit = count if (count>=0 and count<=hardlimit) else 0
-    if count > hardlimit:
-        utfprint("Warning: TokenCount exceeds max limit.")
-    # the above protects the server in case the count limit got corrupted
-    countdata = [rawcountdata.ids[i] for i in range(countlimit)]
+    # The native result points into a shared vector; keep it locked until copied.
+    with token_count_lock:
+        rawcountdata = handle.token_count(countprompt.encode("UTF-8"),tcaddspecial)
+        count = rawcountdata.count
+        hardlimit = (2**31) - 1
+        countlimit = count if (count>=0 and count<=hardlimit) else 0
+        if count > hardlimit:
+            utfprint("Warning: TokenCount exceeds max limit.")
+        # the above protects the server in case the count limit got corrupted
+        countdata = [rawcountdata.ids[i] for i in range(countlimit)]
     return countdata
 
 def detokenize_ids(tokids,addspecial):
@@ -4026,8 +4068,10 @@ def detokenize_ids(tokids,addspecial):
         inputs.ids = (ctypes.c_int * tokidslen)()
         for i, cid in enumerate(tokids):
             inputs.ids[i] = cid
-        detok = handle.detokenize(inputs)
-        detokstr = ctypes.string_at(detok).decode("UTF-8","ignore")
+        # The native function writes a shared string; serialize calls and copying.
+        with detokenize_lock:
+            detok = handle.detokenize(inputs)
+            detokstr = ctypes.string_at(detok).decode("UTF-8","ignore")
     return detokstr
 
 # Performs a web search using DuckDuckGo and extracts text content from the top results.
@@ -7842,7 +7886,7 @@ class KcppProxyHandler(http.server.BaseHTTPRequestHandler):
             chunk_size = self.STREAM_CHUNK if is_sse else self.BULK_CHUNK
             try:  # stream response
                 while True:
-                    chunk = resp.read(chunk_size)
+                    chunk = resp.read1(chunk_size)
                     if not chunk:
                         break
                     self.wfile.write(chunk)
@@ -9389,11 +9433,26 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                 except asyncio.CancelledError:
                     pass
 
-    async def handle_image_request(self, generate_fn, param, cancel_fn):
+    async def send_json_keepalives(self, cancel_fn, interval=50):
+        # Leading whitespace is valid JSON. Padding also helps small proxy buffers
+        # make progress; it cannot bypass a proxy's absolute request time limit.
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                self.wfile.write(b' ' * 2047 + b'\n')
+                self.wfile.flush()
+        except OSError:
+            if cancel_fn:
+                cancel_fn()
+
+    async def handle_image_request(self, generate_fn, param, cancel_fn, keepalive=False):
         monitor_task = None
+        keepalive_task = None
         try:
             if cancel_fn:
                 monitor_task = asyncio.create_task(self.monitor_connection(cancel_fn))
+            if keepalive:
+                keepalive_task = asyncio.create_task(self.send_json_keepalives(cancel_fn))
             loop = asyncio.get_event_loop()
             result = await loop.run_in_executor(None, generate_fn, param)
             return result
@@ -9412,6 +9471,13 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                 try:
                     await monitor_task
                 except asyncio.CancelledError:
+                    pass
+            if keepalive_task:
+                if not keepalive_task.done():
+                    keepalive_task.cancel()
+                try:
+                    await keepalive_task
+                except (asyncio.CancelledError, OSError):
                     pass
 
     def get_multiplayer_idle_state(self,userid):
@@ -9669,7 +9735,7 @@ Change Mode<br>
     def do_GET(self):
         global embedded_kailite, embedded_kcpp_docs, embedded_kcpp_sdui, embedded_kailite_gz, embedded_kcpp_docs_gz, embedded_kcpp_sdui_gz, embedded_lcpp_ui_gz, embedded_musicui, embedded_musicui_gz
         global last_req_time, start_time, cached_chat_template, cached_sd_info, has_vision_support, has_audio_support, has_whisper, friendlymodelname
-        global savedata_obj, has_multiplayer, multiplayer_turn_major, multiplayer_turn_minor, multiplayer_story_data_compressed, multiplayer_dataformat, multiplayer_lastactive, maxctx, maxhordelen, friendlymodelname, lastuploadedcomfyimg, lastgeneratedcomfyimg, lastgeneratedcachedimg, lastgeneratedcachedimgkey, currgenimgkey, KcppVersion, totalgens, preloaded_story, exitcounter, currentusergenkey, friendlysdmodelname, fullsdmodelpath, password, friendlyembeddingsmodelname, voicelist
+        global savedata_obj, has_multiplayer, multiplayer_turn_major, multiplayer_turn_minor, multiplayer_story_data_compressed, multiplayer_dataformat, multiplayer_lastactive, maxctx, maxhordelen, friendlymodelname, lastuploadedcomfyimg, lastgeneratedcomfyimg, lastgeneratedcachedpayload, lastgeneratedcachedpayloadkey, currgenimgkey, KcppVersion, totalgens, preloaded_story, exitcounter, currentusergenkey, friendlysdmodelname, fullsdmodelpath, password, friendlyembeddingsmodelname, voicelist
         global autoswapmode, textName, sttName, ttsName, embedName, musicName, imageName, mmprojName
 
         if self.proxy_OpenLumara("GET"):
@@ -10205,13 +10271,12 @@ Change Mode<br>
         elif clean_path=='/view' or clean_path=='/view.png' or clean_path=='/api/view' or clean_path.startswith('/view_image'): #emulate comfyui
             content_type = 'image/png'
             response_body = lastgeneratedcomfyimg
-        elif clean_path.startswith('/sdapi/v1/get_last.png'):
+        elif clean_path.startswith('/sdapi/v1/get_last.json'):
             parsed_url = urllib.parse.urlparse(self.path)
             parsed_dict = urllib.parse.parse_qs(parsed_url.query)
             genkey = parsed_dict.get('genkey', [''])[0]
-            if genkey and genkey==lastgeneratedcachedimgkey and lastgeneratedcachedimg:
-                content_type = 'image/png'
-                response_body = lastgeneratedcachedimg
+            if genkey and genkey==lastgeneratedcachedpayloadkey and lastgeneratedcachedpayload:
+                response_body = lastgeneratedcachedpayload
             else:
                 response_body = None
         elif clean_path.startswith('/sdapi/v1/progress'):
@@ -10219,9 +10284,13 @@ Change Mode<br>
             parsed_dict = urllib.parse.parse_qs(parsed_url.query)
             genkey = parsed_dict.get('genkey', [''])[0]
             skip_current_image = parse_query_bool(parsed_dict, 'skip_current_image')
-            # with no auth, reveal status without preview image
+            # Only expose progress and previews for the requested active generation.
             auth = bool(genkey and genkey==currgenimgkey)
-            info = a1111_progress_response(auth and not skip_current_image)
+            info = build_a1111_progress_response('idle')
+            if auth:
+                active_info = a1111_progress_response(not skip_current_image)
+                if genkey == currgenimgkey:
+                    info = active_info
             response_body = json.dumps(info).encode()
         elif clean_path=='/history' or clean_path=='/api/history' or clean_path.startswith('/api/history/') or clean_path.startswith('/history/'): #emulate comfyui
             modelNameToReturn = friendlysdmodelname
@@ -10391,7 +10460,7 @@ Change Mode<br>
 
     def do_POST(self):
         global thinkformats
-        global modelbusy, batched_request_runner_count, requestsinqueue, currentusergenkey, totalgens, pendingabortkey, lastuploadedcomfyimg, lastgeneratedcomfyimg, lastgeneratedcachedimg, lastgeneratedcachedimgkey, currgenimgkey, multiplayer_turn_major, multiplayer_turn_minor, multiplayer_story_data_compressed, multiplayer_dataformat, multiplayer_lastactive, net_save_slots, has_vision_support, savestate_limit, mcp_lock
+        global modelbusy, batched_request_runner_count, requestsinqueue, currentusergenkey, totalgens, pendingabortkey, lastuploadedcomfyimg, lastgeneratedcomfyimg, lastgeneratedcachedpayload, lastgeneratedcachedpayloadkey, currgenimgkey, multiplayer_turn_major, multiplayer_turn_minor, multiplayer_story_data_compressed, multiplayer_dataformat, multiplayer_lastactive, net_save_slots, has_vision_support, savestate_limit, mcp_lock
         global autoswapmode, textName, sttName, ttsName, embedName, musicName, imageName, mmprojName
         post_path = self.path.rstrip('/')
         if self.is_fs_protected_path(post_path):
@@ -11908,10 +11977,16 @@ Change Mode<br>
                         time.sleep(0.2) #short delay
                     return
                 elif is_imggen: #image gen
+                    keepalive_started = False
+                    final_write_started = False
                     try:
-                        lastgeneratedcachedimg = b''
-                        lastgeneratedcachedimgkey = ''
-                        currgenimgkey = genparams.get('genkey', '')
+                        lastgeneratedcachedpayload = b''
+                        lastgeneratedcachedpayloadkey = ''
+                        send_keepalive = bool(tryparseint(genparams.get('keepalive', False), 0))
+                        recovery_params = copy.deepcopy(genparams)
+                        recovery_genkey = genparams.get('genkey', '')
+                        recovery_model = imageName if autoswapmode and imageName is not None else friendlysdmodelname
+                        currgenimgkey = recovery_genkey
                         if is_comfyui_imggen:
                             lastgeneratedcomfyimg = b''
                             genparams = sd_comfyui_tranform_params(genparams)
@@ -11927,9 +12002,21 @@ Change Mode<br>
                                 genparams['lora'] = lora_map_name_to_path(loras)
                         abort_gen = handle.sd_abort_generation
                         override_abort_gen = genparams.get('kcpp_extra_args', {}).get('keep_image_gen_on_disconnect', gendefaults.get('keep_image_gen_on_disconnect'))
-                        if override_abort_gen is not None and tryparseint(override_abort_gen, 1):
+                        if override_abort_gen is not None and tryparseint(override_abort_gen, 1): #enable keepalive on poor connection mode
                             abort_gen = None
-                        gen = asyncio.run(self.handle_image_request(sd_generate, genparams, abort_gen))
+                            send_keepalive = True
+                        if tryparseint(genparams.get('frames', 1), 1) > 1: #enable keepalive if more than 1 frame
+                            send_keepalive = True
+                        if send_keepalive:
+                            # Close-delimited JSON works with HTTP/1.0 and HTTP/1.1.
+                            # No Content-Length: the body includes periodic whitespace.
+                            self.close_connection = True
+                            self.send_response(200)
+                            self.send_header('connection', 'close')
+                            self.send_header('X-Accel-Buffering', 'no')
+                            self.end_headers(content_type='application/json')
+                            keepalive_started = True
+                        gen = asyncio.run(self.handle_image_request(sd_generate, genparams, abort_gen, send_keepalive))
                         gendat = gen["data"]
                         genanim = gen["animated"]
                         gendatextra = gen["data_extra"]
@@ -11938,10 +12025,21 @@ Change Mode<br>
                         currgenimgkey = ''
                         genresp = None
                         if gendat:
-                            lastgeneratedcachedimg = base64.b64decode(gendat)
-                            lastgeneratedcachedimgkey = genparams.get('genkey', '')
-                        else:
-                            lastgeneratedcachedimg = b''
+                            recovery_prompt = recovery_params.get('prompt', '')
+                            recovery_negative_prompt = recovery_params.get('negative_prompt', '')
+                            if recovery_negative_prompt:
+                                recovery_prompt = f"{recovery_prompt} ### {recovery_negative_prompt}"
+                            lastgeneratedcachedpayload = json.dumps({
+                                "images": [gendat],
+                                "parameters": recovery_params,
+                                "info": geninfo,
+                                "animated": genanim,
+                                "extra_data": gendatextra,
+                                "final_frame": genfinalframe,
+                                "prompt": recovery_prompt,
+                                "models": [recovery_model],
+                            }).encode()
+                            lastgeneratedcachedpayloadkey = recovery_genkey
                         if is_comfyui_imggen:
                             if gendat:
                                 lastgeneratedcomfyimg = base64.b64decode(gendat)
@@ -11953,12 +12051,20 @@ Change Mode<br>
                             genresp = (json.dumps({"created":int(time.time()),"data":[{"b64_json":gendat}],"background":"opaque","output_format":"png","size":response_size,"quality":"medium"}).encode())
                         else:
                             genresp = (json.dumps({"images":[gendat],"parameters":{},"info":geninfo,"animated":genanim,"extra_data":gendatextra, "final_frame":genfinalframe}).encode())
-                        self.send_response(200)
-                        self.send_header('content-length', str(len(genresp)))
-                        self.end_headers(content_type='application/json')
+                        if not keepalive_started:
+                            self.send_response(200)
+                            self.send_header('content-length', str(len(genresp)))
+                            self.end_headers(content_type='application/json')
+                        final_write_started = True
                         self.wfile.write(genresp)
                     except Exception as ex:
                         currgenimgkey = ''
+                        if keepalive_started and not final_write_started:
+                            # Headers are already committed; finish with a JSON error.
+                            try:
+                                self.wfile.write(json.dumps({"detail": {"msg": "Image generation failed.", "type": "generation_error"}}).encode())
+                            except OSError:
+                                pass
                         utfprint(ex,1)
                         print("Generate Image: The response could not be sent, maybe connection was terminated?")
                         time.sleep(0.2) #short delay
@@ -12509,6 +12615,7 @@ def show_gui():
         togglerope(1,1,1)
         toggleflashattn(1,1,1)
         togglectxshift(1,1,1)
+        togglesmartcache(1,1,1)
         togglehorde(1,1,1)
         toggletaesd(1,1,1)
         togglesdlora(1,1,1)
@@ -12668,6 +12775,7 @@ def show_gui():
     think_effort_var = ctk.StringVar(value="default")
     moeexperts_var = ctk.StringVar(value=str(-1))
     moecpu_var = ctk.StringVar(value=str(0))
+    ffncpu_var = ctk.StringVar(value=str(0))
     defaultgenamt_var = ctk.StringVar(value=str(default_genlen))
     genlimit_var = ctk.StringVar(value=str(0))
     nobostoken_var = ctk.IntVar(value=0)
@@ -12947,6 +13055,10 @@ def show_gui():
         searchedmodels = []
         searchedsizes = []
 
+        def hfsearch_get_help():
+            popup.destroy()
+            display_help()
+
         def confirm_search_model_choice():
             nonlocal modelsearch1_var, modelsearch2_var, model_var, fileinfotxt_var
             if modelsearch1_var.get()!="" and modelsearch2_var.get()!="":
@@ -13050,6 +13162,7 @@ def show_gui():
         modelsearch2_var.trace_add("write", update_search_quant_file_size)
         ctk.CTkLabel(popup, text="", textvariable=fileinfotxt_var, text_color="#ffff00").pack(pady=(10, 0))
         ctk.CTkButton(popup, text="Confirm Selection", command=confirm_search_model_choice).pack(pady=5)
+        ctk.CTkButton(popup, text="Get Help", fg_color="#992222", hover_color="#bb3333", command=hfsearch_get_help).pack(pady=5)
 
         popup.transient(root)
 
@@ -13195,6 +13308,11 @@ def show_gui():
     def togglesmartcache(a,b,c):
         if smartcache_var.get()==1:
             fastforward_var.set(1)
+            cacheslots_entry.grid()
+            cacheslots_label.grid()
+        else:
+            cacheslots_entry.grid_remove()
+            cacheslots_label.grid_remove()
 
     def togglefastforward(a,b,c):
         if fastforward_var.get()==0:
@@ -13299,15 +13417,19 @@ def show_gui():
             autofit_padding_label.grid(row=6, column=0, padx=8, pady=1, stick="nw")
             autofit_padding_entry.grid(row=6, column=0, padx=160, pady=1, stick="nw")
             moecpu_box.grid_remove()
+            ffncpu_box.grid_remove()
             tenos_box.grid_remove()
             moecpu_box_lbl.grid_remove()
+            ffncpu_box_lbl.grid_remove()
             tenos_box_lbl.grid_remove()
         else:
             autofit_padding_label.grid_remove()
             autofit_padding_entry.grid_remove()
             moecpu_box.grid()
+            ffncpu_box.grid()
             tenos_box.grid()
             moecpu_box_lbl.grid()
+            ffncpu_box_lbl.grid()
             tenos_box_lbl.grid()
 
         changed_gpulayers_estimate()
@@ -13426,7 +13548,7 @@ def show_gui():
     makecheckbox(context_tab, "Allow SWA", swa_var, 4,tooltiptxt="SWA will be enabled automatically on models that support it. SWA saves memory but cannot be used with context shifting.", command=toggleswa)
     swa_padding_entry,swa_padding_label = makelabelentry(context_tab,"SWA Padding Tokens:", swa_padding_var, 4, 50, padx=300,singleline=True,tooltip="If the SWA is too small, you can expand it with padding, allowing for greater distance context rewinds.",labelpadx=160)
     makecheckbox(context_tab, "Use SmartCache", smartcache_var, 5,tooltiptxt="Enables intelligent context switching by saving KV cache snapshots to RAM. Requires fast forwarding.", command=togglesmartcache)
-    makelabelentry(context_tab, "CacheSlots:", smartcacheslots_var, row=5, padx=(300), singleline=True, tooltip="Number of slots for smartcache",labelpadx=(220))
+    cacheslots_entry, cacheslots_label = makelabelentry(context_tab, "CacheSlots:", smartcacheslots_var, row=5, padx=(300), singleline=True, tooltip="Number of slots for smartcache",labelpadx=(220))
 
     # context size
     makeslider(context_tab, "Context Size:",contextsize_text, context_var, 18, width=280, set=13,tooltip="What is the maximum context size to support. Model specific. You cannot exceed it.\nLarger contexts require more memory, and not all models support it.")
@@ -13543,7 +13665,8 @@ def show_gui():
     jinja_kwargs_var.trace_add("write", updatejinjathinktoggle)
     gen_defaults_var.trace_add("write", updategendefaults)
     makelabelentry(context_tab, "MoE Experts:", moeexperts_var, row=55, padx=(86), singleline=True, tooltip="Override number of MoE experts.")
-    moecpu_box,moecpu_box_lbl = makelabelentry(context_tab, "MoE CPU Layers:", moecpu_var, row=55, padx=(334), singleline=True, tooltip="Force Mixture of Experts (MoE) weights of the first N layers to the CPU.\nSetting it higher than GPU layers has no effect.", labelpadx=(230))
+    moecpu_box,moecpu_box_lbl = makelabelentry(context_tab, "MoE CPU Layers:", moecpu_var, row=55, padx=(254), singleline=True, tooltip="Force Mixture of Experts (MoE) weights of the first N layers to the CPU.\nSetting it higher than GPU layers has no effect.", labelpadx=(150))
+    ffncpu_box,ffncpu_box_lbl = makelabelentry(context_tab, "FFN CPU Layers:", ffncpu_var, row=55, padx=(414), singleline=True, tooltip="Force dense FFN weights of the first N layers to the CPU.\nSetting it higher than GPU layers has no effect.", labelpadx=(314))
     makelabelentry(context_tab, "Override KV:", override_kv_var, row=57, padx=(86), singleline=True, width=130, tooltip="Override metadata value by key. Separate multiple values with commas. Format is name=type:value. Types: int, float, bool, str")
     tenos_box,tenos_box_lbl = makelabelentry(context_tab, "Override Tensors:", override_tensors_var, row=57, padx=(334), singleline=True, width=130, tooltip="Override selected backend for specific tensors matching tensor_name_regex_pattern=buffer_type, same as in llama.cpp.", labelpadx=(230))
 
@@ -13569,7 +13692,35 @@ def show_gui():
     makecheckbox(model_tab, "GPU", embeddings_gpu_var, 15, 0,padx=(390),tooltiptxt="Uses the GPU for Embeddings.")
     embeddings_gpu_var.trace_add("write", gui_changed_modelfile)
     makefileentry(model_tab, "Preload Story:", "Select Preloaded Story File", preloadstory_var, 17,width=280,singlerow=True,tooltiptxt="Select an optional KoboldAI JSON savefile \nto be served on launch to any client.")
-    makefileentry(model_tab, "SaveData File:", "Select or Create New SaveData Database File", savedatafile_var, 19,width=280,filetypes=[("KoboldCpp SaveDB", "*.jsondb")],singlerow=True,dialog_type=1,tooltiptxt="Selecting a file will allow data to be loaded and saved persistently to this KoboldCpp server remotely. File is created if it does not exist.")
+    savedatafile_tooltip = "Allows connected users to save and load data on this server. File is created automatically on launch if it does not exist. Clear the filename to disable."
+    savedatafile_label, savedatafile_entry, savedatafile_button = makefileentry(model_tab, "SaveData File:", "Select or Create New SaveData Database File", savedatafile_var, 19,width=280,filetypes=[("KoboldCpp SaveDB", "*.jsondb")],singlerow=True,dialog_type=1,tooltiptxt=savedatafile_tooltip)
+    savedatafile_enabled_var = ctk.IntVar(value=0)
+    savedatafile_checkbox = makecheckbox(model_tab, "Enable Server Side SaveData File", savedatafile_enabled_var, row=19, tooltiptxt=savedatafile_tooltip)
+    savedatafile_checkbox.configure(command=lambda: savedatafile_var.set("savedatafile.jsondb"))
+    savedatafile_editing = False
+
+    def update_savedatafile_row(*unused):
+        show_file = bool(savedatafile_var.get()) or savedatafile_editing
+        for widget in (savedatafile_label, savedatafile_entry, savedatafile_button):
+            if show_file:
+                widget.grid()
+            else:
+                widget.grid_remove()
+        if show_file:
+            savedatafile_checkbox.grid_remove()
+        else:
+            savedatafile_enabled_var.set(0)
+            savedatafile_checkbox.grid()
+
+    def savedatafile_focus_changed(editing):
+        nonlocal savedatafile_editing
+        savedatafile_editing = editing
+        update_savedatafile_row()
+
+    savedatafile_entry.bind("<FocusIn>", lambda event: savedatafile_focus_changed(True))
+    savedatafile_entry.bind("<FocusOut>", lambda event: savedatafile_focus_changed(False))
+    savedatafile_var.trace_add("write", update_savedatafile_row)
+    update_savedatafile_row()
     makefileentry(model_tab, "MCP JSON:", "Select a mcp.json configuration file", mcpfile_var, 21,width=280,filetypes=[("MCP JSON", "*.json")],singlerow=True,tooltiptxt="Specify path to mcp.json which contains the Claude Desktop compatible MCP server config.")
     makefileentry(model_tab, "Chat Adapter:", "Select ChatCompletions Adapter File", chatcompletionsadapter_var, 24, width=184, filetypes=[("JSON Adapter", "*.json")], singlerow=True, tooltiptxt="Select an optional ChatCompletions Adapter JSON file to force custom instruct tags.")
     def pickpremadetemplate():
@@ -13850,15 +14001,15 @@ def show_gui():
     # extra tab
     extra_tab = tabcontent["Extra"]
     makelabel(extra_tab, "Extract KoboldCpp Files", 3, 0,tooltiptxt="Unpack KoboldCpp to a local directory to modify its files. You can also launch via koboldcpp.py for faster startup.")
-    ctk.CTkButton(extra_tab , text = "Unpack KoboldCpp To Folder", command = unpack_to_dir ).grid(row=3,column=0, stick="w", padx=(170), pady=2)
+    ctk.CTkButton(extra_tab , text = "Unpack KoboldCpp To Folder", command = unpack_to_dir ).grid(row=3,column=0, stick="w", padx=(210), pady=2)
     makelabel(extra_tab, "Export as .kcppt template", 4, 0,tooltiptxt="Creates a KoboldCpp launch template for others to use.\nEmbeds JSON files directly into exported file when saving.\nWhen loaded, forces the backend to be automatically determined.\nWarning! Not recommended for beginners!")
-    ctk.CTkButton(extra_tab , text = "Generate LaunchTemplate", command = kcpp_export_template ).grid(row=4,column=0, stick="w", padx=(170), pady=2)
-    makelabel(extra_tab, "Analyze GGUF Metadata", 6, 0,tooltiptxt="Reads the metadata, weight types and tensor names in any GGUF file.")
-    ctk.CTkButton(extra_tab , text = "Analyze GGUF", command = analyze_gguf_model_wrapper ).grid(row=6,column=0, stick="w", padx=(170), pady=2)
+    ctk.CTkButton(extra_tab , text = "Generate LaunchTemplate", command = kcpp_export_template ).grid(row=4,column=0, stick="w", padx=(210), pady=2)
+    makelabel(extra_tab, "Analyze GGUF/Safetensors File", 6, 0,tooltiptxt="Reads the metadata, weight types and tensor names in any GGUF or safetensors file.")
+    ctk.CTkButton(extra_tab , text = "Analyze Model", command = analyze_gguf_model_wrapper ).grid(row=6,column=0, stick="w", padx=(210), pady=2)
     if os.name == 'nt':
         makelabel(extra_tab, "File Extensions Handler", 10, 0,tooltiptxt="Makes KoboldCpp the default handler for .kcpps, .kcppt, .ggml and .gguf files.")
-        ctk.CTkButton(extra_tab , text = "Register", width=90, command = register_koboldcpp ).grid(row=10,column=0, stick="w", padx= (170), pady=2)
-        ctk.CTkButton(extra_tab , text = "Unregister", width=90, command = unregister_koboldcpp ).grid(row=10,column=0, stick="w", padx= (264), pady=2)
+        ctk.CTkButton(extra_tab , text = "Register", width=90, command = register_koboldcpp ).grid(row=10,column=0, stick="w", padx= (210), pady=2)
+        ctk.CTkButton(extra_tab , text = "Unregister", width=90, command = unregister_koboldcpp ).grid(row=10,column=0, stick="w", padx= (304), pady=2)
     if sys.platform == "linux":
         def togglezenity(a,b,c):
             global zenity_permitted
@@ -13892,7 +14043,7 @@ def show_gui():
             print(f"Spawn Extra Terminal Failed: {e}")
     if sys.platform == "linux":
         makelabel(extra_tab, "Spawn Terminal Logs", 12, 0,tooltiptxt="A simple terminal logger that duplicates the command line output.")
-        ctk.CTkButton(extra_tab , text = "Spawn Terminal", command = showtermlogs ).grid(row=12,column=0, stick="w", padx= 170, pady=2)
+        ctk.CTkButton(extra_tab , text = "Spawn Terminal", command = showtermlogs ).grid(row=12,column=0, stick="w", padx= 210, pady=2)
 
     OpenLumara_tab = tabcontent["OpenLumara"]
     makelabel(OpenLumara_tab, "OpenLumara AI Agent", 0, 0, tooltiptxt="OpenLumara is a modular, token-efficient AI agent framework that runs alongside KoboldCpp.")
@@ -13912,6 +14063,7 @@ def show_gui():
     togglerope(1,1,1)
     toggleflashattn(1,1,1)
     togglectxshift(1,1,1)
+    togglesmartcache(1,1,1)
     togglehorde(1,1,1)
     toggletaesd(1,1,1)
     togglesdlora(1,1,1)
@@ -14036,6 +14188,7 @@ def show_gui():
             args.overridenativecontext = 0
         args.moeexperts = int(moeexperts_var.get()) if moeexperts_var.get()!="" else -1
         args.moecpu = int(moecpu_var.get()) if moecpu_var.get()!="" else 0
+        args.ffncpu = int(ffncpu_var.get()) if ffncpu_var.get()!="" else 0
         args.defaultgenamt = int(defaultgenamt_var.get()) if defaultgenamt_var.get()!="" else default_genlen
         args.genlimit = int(genlimit_var.get()) if genlimit_var.get()!="" else 0
         args.nobostoken = (nobostoken_var.get()==1)
@@ -14339,6 +14492,8 @@ def show_gui():
             moeexperts_var.set(mydict["moeexperts"])
         if "moecpu" in mydict and mydict["moecpu"]:
             moecpu_var.set(mydict["moecpu"])
+        if "ffncpu" in mydict and mydict["ffncpu"]:
+            ffncpu_var.set(mydict["ffncpu"])
         if "defaultgenamt" in mydict and mydict["defaultgenamt"]:
             defaultgenamt_var.set(mydict["defaultgenamt"])
         if "genlimit" in mydict and mydict["genlimit"]:
@@ -15401,7 +15556,10 @@ def download_model_from_url(url, permitted_types=[".gguf",".safetensors", ".ggml
 def analyze_gguf_model(args,filename):
     try:
         stime = datetime.now()
-        dump_gguf_metadata(filename)
+        if os.path.splitext(filename)[1].lower() == '.safetensors':
+            dump_safetensors_metadata(filename)
+        else:
+            dump_gguf_metadata(filename)
         atime = (datetime.now() - stime).total_seconds()
         print(f"---\nAnalyzing completed in {atime:.2f}s.\n---",flush=True)
     except Exception as e:
@@ -15411,11 +15569,11 @@ def analyze_gguf_model(args,filename):
 def analyze_gguf_model_wrapper(filename=""):
     if not filename or filename=="":
         try:
-            filename = zentk_askopenfilename(title="Select GGUF to analyze")
+            filename = zentk_askopenfilename(title="Select GGUF or safetensors file to analyze")
         except Exception as e:
             print(f"Cannot select file to analyze: {e}")
     if not filename or filename=="" or not os.path.exists(filename):
-        print("Selected GGUF file not found. Please select a valid GGUF file to analyze.")
+        print("Selected model file not found. Please select a valid GGUF or safetensors file to analyze.")
         return
     print("---")
     print(f"Analyzing {filename}, please wait...\n---",flush=True)
@@ -15840,6 +15998,11 @@ def main(launch_args, default_args):
         else:
             exitcounter = 999
             exit_with_error(2,"Specified kcpp config file invalid or not found.")
+
+    # --port only sets args.port, but the GUI tracks port_param, so mirror it there before convert_invalid_args syncs the two
+    if args.port != defaultport:
+        args.port_param = args.port
+
     args = convert_invalid_args(args)
 
     #positional handling for kcpps files (drag and drop)
@@ -16615,9 +16778,10 @@ def kcpp_main_process(launch_args, g_memory=None, gui_launcher=False):
             if MaxMemory[0] == 0: #try to get gpu vram for cuda if not picked yet
                 fetch_gpu_properties(True,True)
             if args.autofit:
-                print("Forced autofit is selected, moecpu and overridetensors will be set automatically.")
+                print("Forced autofit is selected; moecpu, ffncpu and overridetensors will be ignored.")
                 args.overridetensors = ""
                 args.moecpu = 0
+                args.ffncpu = 0
             if args.gpulayers==-1 and args.model_param and os.path.exists(args.model_param):
                 if (not args.usecpu) and ((args.usecuda is not None) or (args.usevulkan is not None) or sys.platform=="darwin"):
                     if MaxMemory[0] > 0:
@@ -16629,7 +16793,7 @@ def kcpp_main_process(launch_args, g_memory=None, gui_launcher=False):
                         print("Unable to detect VRAM, but autofit may still be used if applicable.")
                         args.gpulayers = 0
                     # also enable autofit also if permissible
-                    if not args.autofit and not args.tensor_split and not args.overridetensors and not args.moecpu:
+                    if not args.autofit and not args.tensor_split and not args.overridetensors and not args.moecpu and not args.ffncpu:
                         args.autofit = True
                         args.autofitpadding = default_autofit_padding
                         print("GPU layers is default: Will enable AutoFit for increased estimation accuracy.")
@@ -16727,16 +16891,16 @@ def kcpp_main_process(launch_args, g_memory=None, gui_launcher=False):
             print("WARNING: Selected Text Model does not seem to be a GGUF file! Are you sure you picked the right file?")
         loadok = load_model(modelname)
         print("Load Text Model OK: " + str(loadok))
+        if not loadok:
+            exitcounter = 999
+            exit_with_error(3,"Could not load text model: " + modelname)
+
         if args.mmproj and args.mmproj!="": # multimodal vision and audio support is only known at runtime
             has_audio_support = handle.has_audio_support()
             has_vision_support = handle.has_vision_support()
         else:
             has_audio_support = False
             has_vision_support = False
-
-        if not loadok:
-            exitcounter = 999
-            exit_with_error(3,"Could not load text model: " + modelname)
 
         # The chat completions adapter is a list that needs derivation from chat templates
         # Try to derive chat completions adapter from chat template, now that we have the model loaded
@@ -17294,7 +17458,7 @@ if __name__ == '__main__':
 
     #more advanced params
     advparser = parser.add_argument_group('Advanced Commands')
-    advparser.add_argument("--analyze", metavar=('[filename]'), help="Reads the metadata, weight types and tensor names in any GGUF file.", default="")
+    advparser.add_argument("--analyze", metavar=('[filename]'), help="Reads the metadata, weight types and tensor names in any GGUF or safetensors file.", default="")
     advparser.add_argument("--autofit","--fit","-fit", help="Forces autofit, which attempts to fit the model in the best possible way. Overrides everything else.", action='store_true')
     advparser.add_argument("--autofitpadding", metavar=('[padding in MB]'), help="How much spare allowance in MB should autofit reserve? If it's too little, the load might fail.", type=int, default=default_autofit_padding)
     advparser.add_argument("--batchsize","--blasbatchsize","--batch-size","-b", help="Sets the batch size used in batched processing (default 512). Setting it to -1 disables batched mode, but keeps other benefits like GPU offload.", type=int,choices=[-1,16,32,64,128,256,512,1024,2048,4096], default=512)
@@ -17335,6 +17499,7 @@ if __name__ == '__main__':
     advparser.add_argument("--mmproj", metavar=('[filename]'), help="Select a multimodal projector file for vision models.", default="")
     advparser.add_argument("--mmprojcpu","--no-mmproj-offload", help="Force CLIP for Vision mmproj always on CPU.", action='store_true')
     advparser.add_argument("--moecpu","--n-cpu-moe", "-ncmoe", metavar=('[layers affected]'), help="Keep the Mixture of Experts (MoE) weights of the first N layers in the CPU. If no value is provided, applies to all layers.", nargs='?', const=999, type=int, default=0)
+    advparser.add_argument("--ffncpu","--n-cpu-ffn", "-ncffn", metavar=('[layers affected]'), help="Keep the dense FFN weights of the first N layers in the CPU. If no value is provided, applies to all layers.", nargs='?', const=999, type=int, default=0)
     advparser.add_argument("--moeexperts", metavar=('[num of experts]'), help="How many experts to use for MoE models (default=follow gguf)", type=int, default=-1)
     advparser.add_argument("--multiuser", help="Set maximum number of queued incoming requests allowed.", metavar=('limit'), type=int, nargs='?', const=multiuser_concurrent_limit, default=multiuser_concurrent_limit)
     advparser.add_argument("--multiplayer", help="Hosts a shared multiplayer session that others can join.", action='store_true')
