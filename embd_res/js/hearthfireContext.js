@@ -28,12 +28,12 @@ let triggerHearthfireRequest = () => {
                 window.hearthfireGenActive = true;
                 // Temporarily override the submit length
                 let og_finalize_submit_payload = finalize_submit_payload;
-                finalize_submit_payload = alias((submit_payload) => {
+                finalize_submit_payload = alias(og_finalize_submit_payload, (submit_payload) => {
                     if (submit_payload && submit_payload.params) {
                         submit_payload.params.max_length = 1;
                     }
                     return submit_payload;
-                }, undefined, startHearthfireTimer);
+                }, undefined);
 
                 // Trigger warmup request here
                 submit_generation("").then(() => {
