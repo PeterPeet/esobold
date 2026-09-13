@@ -809,7 +809,7 @@ window.addEventListener('load', () => {
     settingLabelElem = createSettingElemRange("turnsMaxContent", "Turns max content", "The maximum amount tokens allowed for user and AI turns. Enabling this option will create a sliding window. With smaller models this is often not needed as the prompt processing speed is high, but can be useful for larger models. Please note, the amount selected here should be your total possible context minus the amount you expect to be used for memory, world info, authors note, system prompt etc as a maximum.", 0, 131072, 1024, 0)
     settingsBox.append(settingLabelElem)
 
-    settingLabelElem = createSettingElemRange("turnsOldContentRatio", "Turns old content ratio", "The ratio of old content to retain within the sliding window.", 0, 1, 0.05, 0)
+    settingLabelElem = createSettingElemRange("turnsOldContentRatio", "Turns old content ratio", "The ratio of old content to retain within the sliding window.", 0, 1, 0.05, 0.6)
     settingsBox.append(settingLabelElem)
 
     settingLabelElem = createSettingElemBool("hearthfireContext", "Hearthfire context", "When this flag is set to true, after a user gets a reply another request will be automatically triggered. The second request preps the context for future interactions which should reduce the wait time (essentially prompt processing while you start to type your reply).")
