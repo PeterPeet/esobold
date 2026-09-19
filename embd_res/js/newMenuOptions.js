@@ -813,6 +813,8 @@ window.addEventListener('load', () => {
     settingsBox.append(settingLabelElem)
 
     settingLabelElem = createSettingElemBool("hearthfireContext", "Hearthfire context", "When this flag is set to true, after a user gets a reply another request will be automatically triggered. The second request preps the context for future interactions which should reduce the wait time (essentially prompt processing while you start to type your reply).")
+    // Hide hearthfire context as it is buggy at the moment
+    settingLabelElem.style.display = "none"
     settingsBox.append(settingLabelElem)
 
     toolsSettingsBox.appendChild(createNewSubSection("Esobold Agent Tools"))
