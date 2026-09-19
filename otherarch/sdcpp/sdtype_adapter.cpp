@@ -18,6 +18,7 @@
 
 #include "otherarch/utils.h"
 #include "model_adapter.h"
+#include "sdcpp_logger_adapter.h"
 
 #include "stable-diffusion.h"
 #include "src/kcpp_sd_extensions.h"
@@ -362,6 +363,8 @@ static bool is_video_model(kcpp_sd::model_info info)
 
 bool sdtype_load_model(const sd_load_model_inputs inputs) {
 
+    kcpp_sd_preserve_ggml_logger();
+
     sd_is_quiet = inputs.quiet;
     set_sd_quiet(sd_is_quiet);
     executable_path = sd_get_u8path(inputs.executable_path);
@@ -401,6 +404,8 @@ bool sdtype_load_model(const sd_load_model_inputs inputs) {
         lora_dynamic = !!(inputs.lora_apply_mode & (1<<3));
         lora_cache   = lora_dynamic && !!(inputs.lora_apply_mode & (1<<4));
     }
+    // TODO: LoRA caching produces errors after a preloaded LoRA is later removed on a request
+    lora_cache = false;
 
     if(lora_map.items.size() > 0)
     {
@@ -558,7 +563,7 @@ bool sdtype_load_model(const sd_load_model_inputs inputs) {
     params.vae_conv_direct = sd_params->vae_conv_direct;
     params.model_args = "chroma_use_dit_mask=true";
     params.max_vram = max_vram.c_str();
-    params.stream_layers = inputs.stream_layers;
+    //params.stream_layers = inputs.stream_layers; // removed in master-843
     params.eager_load = true; //kcpp should preload everything
     params.enable_mmap = inputs.use_mmap;
     params.backend = backend.c_str();
@@ -1554,6 +1559,8 @@ sd_generation_outputs sdtype_generate(const sd_generation_inputs inputs)
         vid_gen_params.video_frames = vid_req_frames;
         vid_gen_params.fps = vid_fps;
         vid_gen_params.vae_tiling_params = params.vae_tiling_params;
+        vid_gen_params.loras = params.loras;
+        vid_gen_params.lora_count = params.lora_count;
         if (!info.is_minimaxh3 && ref_audio_data.size()>0) {
             input_audio = load_audio_from_b64(ref_audio_data[0]);
             if (input_audio.data == nullptr) {

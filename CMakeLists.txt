@@ -561,16 +561,30 @@ endif()
 set_source_files_properties(vendor/hash/sha256/sha256.c PROPERTIES COMPILE_OPTIONS ${KCPP_HASH_NO_WARN_FLAG})
 
 add_library(sdtype_adapter
+            sdcpp_logger_adapter.cpp
             otherarch/sdcpp/sdtype_adapter.cpp
+            otherarch/sdcpp/src/core/compute_workspace.cpp
+            otherarch/sdcpp/src/core/ggml_extend.cpp
+            otherarch/sdcpp/src/core/ggml_runner.cpp
             otherarch/sdcpp/src/core/ggml_graph_cut.cpp
             otherarch/sdcpp/src/core/ggml_graph_cut.h
+            otherarch/sdcpp/src/core/ggml_tensor_utils.cpp
+            otherarch/sdcpp/src/core/runner_cache.cpp
+            otherarch/sdcpp/src/core/segment_graph_bindings.cpp
+            otherarch/sdcpp/src/core/segment_weight_pipeline.cpp
             otherarch/sdcpp/examples/cli/image_metadata.cpp
+            otherarch/sdcpp/src/detailer.cpp
             otherarch/sdcpp/src/model_manager.cpp
+            otherarch/sdcpp/src/model_manager_files.cpp
             otherarch/sdcpp/src/model_manager.h
+            otherarch/sdcpp/src/model_manager_prefetch.cpp
             otherarch/sdcpp/src/extensions/pulid_extension.cpp
             otherarch/sdcpp/src/model_loader.cpp
+            otherarch/sdcpp/src/model_loader_files.cpp
+            otherarch/sdcpp/src/model/adapter/lora_ops.cpp
             otherarch/sdcpp/src/extensions/photomaker_extension.cpp
             otherarch/sdcpp/src/runtime/sample-cache.cpp
+            otherarch/sdcpp/src/runtime/tiling.cpp
             otherarch/sdcpp/src/core/util.cpp
             otherarch/sdcpp/src/name_conversion.cpp
             otherarch/sdcpp/src/upscaler.cpp
@@ -578,6 +592,11 @@ add_library(sdtype_adapter
             otherarch/sdcpp/src/runtime/guidance.h
             otherarch/sdcpp/src/runtime/imatrix.cpp
             otherarch/sdcpp/src/runtime/imatrix.h
+            otherarch/sdcpp/src/pipeline/diffusion_engine.cpp
+            otherarch/sdcpp/src/pipeline/image.cpp
+            otherarch/sdcpp/src/pipeline/model_builders.cpp
+            otherarch/sdcpp/src/pipeline/request.cpp
+            otherarch/sdcpp/src/pipeline/video.cpp
             otherarch/sdcpp/src/stable-diffusion.cpp
             otherarch/sdcpp/thirdparty/zip.c
             otherarch/sdcpp/src/model_io/gguf_io.cpp

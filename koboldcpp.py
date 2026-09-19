@@ -68,7 +68,7 @@ default_visionmaxres = 1024
 net_save_slots = 12
 savestate_limit_default = 5
 savestate_limit = 0 #savestate slots start at 0, only set when load model
-default_vae_tile_threshold = 640
+default_vae_tile_threshold = 512
 default_sdvaedevice = 'main'
 default_sdclipdevice = 'CPU'
 default_native_ctx = 16384
@@ -267,6 +267,7 @@ deprecated_keys = {
     "noblas",
     "nommap",
     "pipelineparallel",
+    "nopipelineparallel",
     "sdnotile",
     "forceversion",
     "sdgendefaults",
@@ -345,6 +346,7 @@ class load_model_inputs(ctypes.Structure):
                 ("use_fastforward", ctypes.c_bool),
                 ("kcpp_main_gpu", ctypes.c_int),
                 ("batchsize", ctypes.c_int),
+                ("ubatchsize", ctypes.c_int),
                 ("autofit", ctypes.c_bool),
                 ("autofit_tax_mb", ctypes.c_int),
                 ("gpulayers", ctypes.c_int),
@@ -369,7 +371,6 @@ class load_model_inputs(ctypes.Structure):
                 ("swa_padding", ctypes.c_int),
                 ("smartcache", ctypes.c_bool),
                 ("smartcacheslots", ctypes.c_int),
-                ("pipelineparallel", ctypes.c_bool),
                 ("lora_multiplier", ctypes.c_float),
                 ("devices_override", ctypes.c_char_p),
                 ("quiet", ctypes.c_bool),
@@ -1571,7 +1572,7 @@ def get_capabilities():
     can_search_documents = has_embeddings and bool(_admindocsdir) and os.path.isdir(_admindocsdir)
     hasOpenLumaraEnabled = global_memory["OpenLumara"]
     hasOpenLumaraAuthenticated = bool(getattr(args, "OpenLumara_requirelogin", True))
-    return {"result":"KoboldCpp", "version":KcppVersion, "protected":has_password, "llm":has_llm, "txt2img":has_txt2img,"vision":visionSupport,"audio":audioSupport,"transcribe":has_whisper,"multiplayer":has_multiplayer,"websearch":has_search,"tts":has_tts, "embeddings":has_embeddings, "music":has_music, "fs":has_fs, "fsMode":fs_mode, "savedata":(savedata_obj is not None), "admin": admin_type, "router":has_router, "guidance": has_guidance, "jinja": has_jinja, "mcp":has_mcp, "hasServerSaving": has_server_saving, "hasAdminWithHF": had_admin_with_hf, "embeddingModel": embeddingModel, "canSearchDocuments": can_search_documents, "hasOpenLumaraEnabled": hasOpenLumaraEnabled, "hasOpenLumaraAuthenticated": hasOpenLumaraAuthenticated}
+    return {"result":"KoboldCpp", "version":KcppVersion, "protected":has_password, "llm":has_llm, "txt2img":has_txt2img,"vision":visionSupport,"audio":audioSupport,"transcribe":has_whisper,"multiplayer":has_multiplayer,"websearch":has_search,"tts":has_tts, "embeddings":has_embeddings, "music":has_music, "fs":has_fs, "fsMode":fs_mode, "musicllm":bool(musicllmmodelpath), "savedata":(savedata_obj is not None), "admin": admin_type, "router":has_router, "guidance": has_guidance, "jinja": has_jinja, "mcp":has_mcp, "hasServerSaving": has_server_saving, "hasAdminWithHF": had_admin_with_hf, "embeddingModel": embeddingModel, "canSearchDocuments": can_search_documents, "hasOpenLumaraEnabled": hasOpenLumaraEnabled, "hasOpenLumaraAuthenticated": hasOpenLumaraAuthenticated}
 
 
 def scan_directory(dirpath, valid_exts, depth):
@@ -2164,6 +2165,7 @@ def load_model(model_filename):
     else:
         inputs.quant_k = inputs.quant_v = 0
     inputs.batchsize = args.batchsize
+    inputs.ubatchsize = args.ubatchsize
     inputs.autofit = args.autofit
     inputs.autofit_tax_mb = int(args.autofitpadding) + int(calulated_gpu_overhead/(1024*1024))
     inputs.gpulayers = args.gpulayers
@@ -2212,7 +2214,6 @@ def load_model(model_filename):
     sclimit = (savestate_limit_default if scint<=1 else scint)
     savestate_limit = sclimit
     inputs.smartcacheslots = sclimit
-    inputs.pipelineparallel = (not args.nopipelineparallel)
     inputs.continuous_batching_slots = args.parallelrequests if (args.parallelrequests>1) else 0
     inputs.rpc_mode = (2 if args.rpcmode=="host" else (1 if args.rpcmode=="connect" else 0))
     inputs.rpc_targets = (args.rpctargets if args.rpcmode=="connect" else "").encode("UTF-8")
@@ -2336,8 +2337,17 @@ def generate(genparams, stream_flag=False):
             print(f"\n!!! ====== !!!\n(Warning! Request max_context_length={max_context_length} exceeds allocated context size of {maxctx}. It will be reduced to fit. Consider launching with increased --contextsize to avoid issues. This message will only show once per session.)\n!!! ====== !!!")
             showmaxctxwarning = False
         max_context_length = maxctx
-    min_remain_hardlimit = max(min(max_context_length-4, 16),int(max_context_length*0.2))
-    min_remain_softlimit = max(min(max_context_length-4, 16),int(max_context_length*0.4))
+    # Estimate the complete textual input before deciding how much of the
+    # context may be used for output. Media token usage cannot be estimated by
+    # token_count, so retain the more conservative limit for multimodal input.
+    estimated_input_tokens = token_count_text(prompt, True)
+    if estimated_input_tokens >= 0 and memory:
+        memory_token_count = token_count_text(memory, False)
+        estimated_input_tokens = (estimated_input_tokens + memory_token_count) if memory_token_count >= 0 else -1
+    if images or audio:
+        estimated_input_tokens = -1
+    min_remain_hardlimit = calculate_min_remain_hardlimit(max_context_length, estimated_input_tokens)
+    min_remain_softlimit = max(min(max_context_length-4, 16),int(max_context_length*0.45))
     if args.genlimit > 0 and max_length > args.genlimit:
         max_length = args.genlimit
     if max_length >= (max_context_length-min_remain_softlimit):
@@ -2356,6 +2366,8 @@ def generate(genparams, stream_flag=False):
         reasoning_budget = tryparseint(0.25 * max_length,-1)  # 25% of gen amount
     elif reasoning_effort == "medium":
         reasoning_budget = tryparseint(0.5 * max_length,-1)  # 50% of gen amount
+    elif reasoning_effort == "high":
+        reasoning_budget = tryparseint(0.75 * max_length,-1)  # 75% of gen amount
     else:
         pass #unrestricted
 
@@ -3063,7 +3075,7 @@ def sd_generate(genparams):
     if flow_shift is not None and flow_shift < 0:
         flow_shift = None # fall back to the default
     sample_steps = (1 if sample_steps < 1 else (forced_steplimit if sample_steps > forced_steplimit else sample_steps))
-    vid_req_frames = (1 if vid_req_frames < 1 else (400 if vid_req_frames > 400 else vid_req_frames))
+    vid_req_frames = (1 if vid_req_frames < 1 else (480 if vid_req_frames > 480 else vid_req_frames))
     vid_fps = (16 if vid_fps < 16 else (32 if vid_fps > 32 else vid_fps))
 
     swap_refimg = (True if tryparseint(genparams.get("send_as_refimg", 0),0) else False)
@@ -3996,7 +4008,7 @@ def embeddings_generate(genparams):
     return {"count":tokcnt, "data":tokarrs}
 
 def music_load_model(musicllm,musicembedding,musicdiffusion,musicvae):
-    global args
+    global args, musicllmmodelpath
     inputs = music_load_model_inputs()
     inputs.musicllm_filename = musicllm.encode("UTF-8")
     inputs.musicembedding_filename = musicembedding.encode("UTF-8")
@@ -4005,6 +4017,7 @@ def music_load_model(musicllm,musicembedding,musicdiffusion,musicvae):
     inputs.lowvram = True if args.musiclowvram else False
     inputs = set_backend_props(inputs)
     ret = handle.music_load_model(inputs)
+    musicllmmodelpath = musicllm if ret else ""
     return ret
 
 def music_generate_codes(genparams):
@@ -4058,6 +4071,22 @@ def tokenize_ids(countprompt,tcaddspecial):
         countdata = [rawcountdata.ids[i] for i in range(countlimit)]
     return countdata
 
+def token_count_text(countprompt,tcaddspecial):
+    # Count without copying the shared token ID vector when only its size is needed.
+    with token_count_lock:
+        rawcountdata = handle.token_count(countprompt.encode("UTF-8"),tcaddspecial)
+        count = rawcountdata.count
+    hardlimit = (2**31) - 1
+    if count < 0 or count > hardlimit:
+        utfprint("Warning: TokenCount exceeds max limit.")
+        return -1
+    return count
+
+def calculate_min_remain_hardlimit(max_context_length, input_token_count):
+    # Small inputs (<25% max ctx) may use up to 80% of context for generation. For larger or unknown inputs, max allowed is 65% instead
+    min_remain_ratio = 0.2 if 0 <= input_token_count < max_context_length * 0.25 else 0.35
+    return max(min(max_context_length-4, 16), int(max_context_length*min_remain_ratio))
+
 def detokenize_ids(tokids,addspecial):
     tokidslen = len(tokids)
     detokstr = ""
@@ -4079,12 +4108,12 @@ def websearch(query):
     global websearch_lastquery
     global websearch_lastresponse
     global nocertify
-    # sanitize query
-    query = re.sub(r'[+\-\"\\/*^|<>~`]', '', query) # Remove blacklisted characters
-    query = re.sub(r'\s+', ' ', query).strip() # Replace multiple spaces with a single space
-    if not query or query=="":
+    # DDG already normalizes whitespace, but we optimize a tiny bit by doing it ourselves.
+    query = re.sub(r'\s+', ' ', query).strip()
+    if not query:
         return []
-    query = query[:300] # only search first 300 chars, due to search engine limits
+    # Clamp query to supported 500 decoded UTF-8 bytes, not codepoints.
+    query = query.encode('utf-8', errors='ignore')[:500].decode('utf-8', errors='ignore')
     if query==websearch_lastquery:
         print("\nReturning cached websearch...")
         return websearch_lastresponse
@@ -4203,7 +4232,11 @@ def websearch(query):
             if self.recordingTitle or self.recordingDesc or self.recordingUrl:
                 self.currsegmenttxt += data
 
-    encoded_query = urllib.parse.quote(query)
+    # DDG supports `+` as spaces, which is more readable and compact than `%20`.
+    # Literal pluses get themselves encoded as `%2B`.
+    # And `_plus` method variant correctly encodes `/` to `%2F` by default.
+    # The variant was practically made for what we do here.
+    encoded_query = urllib.parse.quote_plus(query)
     search_url = f"https://html.duckduckgo.com/html/?q={encoded_query}"
 
     try:
@@ -5359,6 +5392,9 @@ ws ::= | " " | "\n" [ \t]{0,20}
                         break
                 if jinjatools and len(jinjatools)>0:
                     genparams["using_openai_tools"] = True
+                    if api_format == 4 and args.jinja_tools:
+                        # Default Jinja tool requests to 0.5 and cap their temperature at 1.0.
+                        genparams["temperature"] = min(tryparsefloat(genparams.get("temperature", adapter_obj.get("temperature", 0.5)), 0.5), 1.0)
                 # handle media
                 images_added, audio_added = sweep_media_from_messages(messages_array)
             else:
@@ -8538,6 +8574,10 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
         }
         return ret
 
+    def make_openai_generation_error(self):
+        return {"error": {"message": "The model failed to generate a response.",
+                          "type": "server_error", "param": None, "code": "server_error"}}
+
     async def generate_text(self, genparams, api_format, stream_flag):
         global friendlymodelname, chatcompl_adapter, currfinishreason, thinkformats
         global autoswapmode, textName, sttName, ttsName, embedName, musicName, imageName, mmprojName
@@ -8557,19 +8597,27 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
             return generate(genparams=genparams,stream_flag=stream_flag)
 
         genout = {"text": "", "status": -1, "stopreason": -1, "prompt_tokens":0, "completion_tokens": 0, "total_tokens": 0}
-        if stream_flag:
-            loop = asyncio.get_event_loop()
-            executor = ThreadPoolExecutor()
-            genout = await loop.run_in_executor(executor, run_blocking)
-        else:
-            genout = run_blocking()
+        if api_format in (3, 4):
+            genparams['_oai_generation_pending'] = True
+        try:
+            if stream_flag:
+                loop = asyncio.get_event_loop()
+                executor = ThreadPoolExecutor()
+                genout = await loop.run_in_executor(executor, run_blocking)
+            else:
+                genout = run_blocking()
+        finally:
+            genparams.pop('_oai_generation_pending', None)
 
         recvtxt = genout['text']
         if recvtxt is not None and not isinstance(recvtxt, str):
             recvtxt = recvtxt.decode("UTF-8", "ignore") if isinstance(recvtxt, bytes) else str(recvtxt)
         prompttokens = genout['prompt_tokens'] if genout['prompt_tokens'] > 0 else 0
         comptokens = genout['completion_tokens'] if genout['completion_tokens'] > 0 else 0
-        currfinishreason = "error" if (genout['stopreason'] == -2) else ("length" if (genout['stopreason'] != 1) else "stop")
+        currfinishreason = "error" if (genout['stopreason'] == -2) else ("stop" if genout['stopreason'] in (1, 2) else "length")
+        if api_format in (3, 4) and (genout['stopreason'] == -2 or genout['status'] == 0):
+            genparams['_oai_generation_error'] = True
+            return self.make_openai_generation_error()
 
         # grab logprobs if not streaming
         logprobsdict = None
@@ -8585,6 +8633,8 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
 
         utfprint("\nOutput: " + recvtxt,1)
 
+        # The native parser needs the full output to match reasoning in the generation prompt.
+        native_toolcall_text = recvtxt
         #handle potential think tags, but only chat completions will return them. the others just drop them
         reasoningtxt = ""
         if api_format==4 or api_format==8 or api_format==9: #chat completions, responses and anthropic messages, but only chat has reasoning returned
@@ -8610,7 +8660,7 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
             using_openai_tools = genparams.get('using_openai_tools', False)
             if using_openai_tools:
                 # first, let llama.cpp's chat parser handle known template-specific tool formats
-                tool_calls = native_parse_toolcall_tags(recvtxt, genparams)
+                tool_calls = native_parse_toolcall_tags(native_toolcall_text, genparams)
                 # fallback: check and potentially segment multiple tags for multi-tool calls
                 if not tool_calls:
                     tool_calls = repack_toolcall_tags(recvtxt,genparams.get('tools', []))
@@ -8789,6 +8839,33 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
         self.wfile.write(f'{data}\n'.encode())
         self.wfile.flush()
 
+    async def send_tool_stream_keepalives(self, genparams, api_format, interval=50):
+        # Tool calls may be buffered until generation finishes. Keep the stream
+        # active without adding content to the eventual tool call.
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                if not (genparams.get('sync_toolcall_stream_ineligible', False) or genparams.get('sync_toolcall_potential_triggered', False)):
+                    continue
+                if api_format == 7: # Ollama NDJSON requires a valid JSON line
+                    model_name = friendlymodelname
+                    if autoswapmode and textName is not None:
+                        model_name = textName
+                    keepalive = {
+                        "model": model_name,
+                        "created_at": str(datetime.now(timezone.utc).isoformat()),
+                        "message": {"role": "assistant", "content": ""},
+                        "done": False,
+                    }
+                    packet = json.dumps(keepalive).encode()
+                    self.wfile.write(packet + (b' ' * max(1, 2047 - len(packet))) + b'\n')
+                else: # OpenAI and Anthropic use SSE; comments are client-invisible
+                    self.wfile.write(b': keepalive' + (b' ' * 2035) + b'\n\n')
+                self.wfile.flush()
+        except OSError:
+            self.close_connection = True
+            handle.abort_generate()
+
     async def handle_sse_stream(self, genparams, api_format):
         global friendlymodelname, currfinishreason, thinkformats, tool_call_pairs, cached_chat_template
         global autoswapmode, textName, sttName, ttsName, embedName, musicName, imageName, mmprojName
@@ -8813,6 +8890,7 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
         self.send_header("connection", "keep-alive")
         stream_content_type = 'application/x-ndjson' if api_format == 6 or api_format == 7 else 'text/event-stream'
         self.end_headers(content_type=stream_content_type)
+        genparams['_sse_stream_started'] = True
 
         # if tools, do not send anything else - OAI tool calls will be handled with fakestreaming!
         # only exception is if we know the exact toolcall tag to segment!
@@ -8882,16 +8960,24 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
             while True:
                 if batch_request_id < 0:
                     batch_request_id = genparams.get('_batch_request_id', -1)
-                    if genparams.get('_batch_expected', False) and batch_request_id < 0 and not genparams.get('_batch_fallback', False):
-                        await asyncio.sleep(async_sleep_short)
-                        continue
+                if api_format in (3, 4) and genparams.get('_oai_generation_error', False):
+                    break
+                if genparams.get('_batch_expected', False) and batch_request_id < 0 and not genparams.get('_batch_fallback', False):
+                    await asyncio.sleep(async_sleep_short)
+                    continue
                 using_batch_stream = batch_request_id >= 0
                 streamDone = handle.batch_generate_has_finished(batch_request_id) if using_batch_stream else handle.has_finished() #exit next loop on done
+                if streamDone and api_format in (3, 4) and genparams.get('_oai_generation_pending', False):
+                    await asyncio.sleep(async_sleep_short) # wait for the request's success/error result
+                    continue
                 if streamDone:
                     if using_batch_stream and batch_final_result is None:
                         batch_final_result = handle.batch_generate_result(batch_request_id)
                     sr = batch_final_result.stopreason if using_batch_stream else handle.get_last_stop_reason()
-                    currfinishreason = "error" if sr==-2 else ("length" if (sr!=1) else "stop")
+                    currfinishreason = "error" if sr==-2 else ("stop" if sr in (1, 2) else "length")
+                    if api_format in (3, 4) and (sr == -2 or (using_batch_stream and batch_final_result.status == 0)):
+                        # The completed generation result will be sent as an error in do_POST.
+                        break
                     prompttokens = batch_final_result.prompt_tokens if using_batch_stream else handle.get_last_input_count()
                 tokenStr = ""
                 streamcount = handle.batch_generate_stream_count(batch_request_id) if using_batch_stream else handle.get_stream_count()
@@ -9168,6 +9254,8 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                                 #         # await asyncio.sleep(async_sleep_short) # generation finished: end stream handler
                                 #         # return
 
+                            if api_format in (4, 9) and genparams.get('sync_toolcall_potential_triggered', False):
+                                need_split_final_msg = False # the fake-stream path owns the final chunk
                             if need_split_final_msg: #we need to send one message without the finish reason, then send a finish reason with no msg to follow standards
                                 if api_format == 4:  # if oai chat, set format to expected openai streaming response
                                     event_str = json.dumps({"id":chatcmpl_id,"object":"chat.completion.chunk","created":int(time.time()),"model":modelNameToReturn,"choices":[{"index":0,"finish_reason":None,"delta":delta}]})
@@ -9217,7 +9305,8 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                                     logprobsdict = parse_last_logprobs(lastlogprobs)
                                     addonstr = json.dumps({"id":chatcmpl_id,"object":"chat.completion.chunk","created":int(time.time()),"model":modelNameToReturn,"choices":[{"index":0,"finish_reason":None,"delta":{'role':'assistant','content':''},"logprobs":logprobsdict}]})
                                     await self.send_oai_sse_event(addonstr)
-                                event_str = json.dumps({"id":chatcmpl_id,"object":"chat.completion.chunk","created":int(time.time()),"model":modelNameToReturn,"choices":[{"index":0,"finish_reason":currfinishreason,"delta":delta}]})
+                                finish_reason = currfinishreason if streamDone and not genparams.get('sync_toolcall_potential_triggered', False) else None
+                                event_str = json.dumps({"id":chatcmpl_id,"object":"chat.completion.chunk","created":int(time.time()),"model":modelNameToReturn,"choices":[{"index":0,"finish_reason":finish_reason,"delta":delta}]})
                                 genparams['sync_toolcall_first_role_sent'] = True
                                 await self.send_oai_sse_event(event_str)
                             elif api_format == 3:  # non chat completions
@@ -9226,7 +9315,7 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                                     logprobsdict = parse_last_logprobs(lastlogprobs)
                                     addonstr = json.dumps({"id":cmpl_id,"object":"text_completion","created":int(time.time()),"model":modelNameToReturn,"choices":[{"index":0,"finish_reason":None,"text":"","logprobs":logprobsdict}]})
                                     await self.send_oai_sse_event(addonstr)
-                                event_str = json.dumps({"id":cmpl_id,"object":"text_completion","created":int(time.time()),"model":modelNameToReturn,"choices":[{"index":0,"finish_reason":currfinishreason,"text":tokenStr}]})
+                                event_str = json.dumps({"id":cmpl_id,"object":"text_completion","created":int(time.time()),"model":modelNameToReturn,"choices":[{"index":0,"finish_reason":currfinishreason if streamDone else None,"text":tokenStr}]})
                                 await self.send_oai_sse_event(event_str)
                             elif api_format == 6 or api_format == 7: # Ollama newline-delimited JSON streaming
                                 created_at = str(datetime.now(timezone.utc).isoformat())
@@ -9302,7 +9391,7 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                                 if anthropic_first_loop:
                                     await self.send_anthropic_sse_event("message_start", json.dumps({"type":"message_start","message":{"type":"message","id":f"msg_A{req_id_suffix}","role":"assistant","model":modelNameToReturn,"usage":{"input_tokens":prompttokens,"output_tokens":0}}}))
                                     anthropic_first_loop = False
-                                if not genparams.get("sync_toolcall_potential_triggered", False):
+                                if not genparams.get("sync_toolcall_potential_triggered", False) or sync_potential_toolcall_splitmatch:
                                     reasoning = delta.get("reasoning_content", "")
                                     content = delta.get("content", "")
                                     if reasoning and genparams.get('encapsulate_thinking', True):
@@ -9330,7 +9419,7 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                                         # edge case: stream ended with only thinking or no content at all — open a text block so we always close one
                                         await self.send_anthropic_sse_event("content_block_start", json.dumps({"type":"content_block_start","index":anthropic_block_index,"content_block":{"type":"text","text":""}}))
                                     await self.send_anthropic_sse_event("content_block_stop", json.dumps({"type":"content_block_stop","index":anthropic_block_index}))
-                                    await self.send_anthropic_sse_event("message_delta", json.dumps({"type":"message_delta","delta":{"stop_reason":anthropic_reason,"stop_sequence":None},"usage":{"output_tokens":current_token}}))
+                                    await self.send_anthropic_sse_event("message_delta", json.dumps({"type":"message_delta","delta":{"stop_reason":anthropic_reason,"stop_sequence":None},"usage":{"input_tokens":prompttokens,"output_tokens":current_token}}))
                                     await self.send_anthropic_sse_event("message_stop", json.dumps({"type":"message_stop"}))
                             else:
                                 event_str = json.dumps({"token": tokenStr, "finish_reason":currfinishreason})
@@ -9342,6 +9431,8 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                     await asyncio.sleep(async_sleep_short) #this should keep things responsive
 
                 if streamDone:
+                    if api_format in (4, 9) and genparams.get('sync_toolcall_potential_triggered', False):
+                        return # finish and usage follow after the buffered tool calls are parsed
                     if api_format == 4 or api_format == 3:  # if oai chat, send last [DONE] message consistent with openai format
                         strop = genparams.get("stream_options",None)
                         if (strop and strop.get("include_usage",False)):  # Send a final chunk with usage info, only if requested
@@ -9353,6 +9444,7 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                             await self.send_oai_sse_event(usage_str)
                         await self.send_oai_sse_event('[DONE]')
                         await asyncio.sleep(async_sleep_short)
+                    genparams['_sse_stream_finished'] = not genparams.get('sync_toolcall_potential_triggered', False)
                     break
         except Exception as ex:
             print("Token streaming was interrupted or aborted!")
@@ -9363,6 +9455,9 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                 handle.abort_generate()
             await asyncio.sleep(0.1) #short delay
         finally:
+            if api_format == 9:
+                genparams['_anthropic_stream_state'] = (not anthropic_first_loop, anthropic_block_index,
+                                                       anthropic_thinking_block_open or anthropic_text_block_started)
             if batch_request_id >= 0:
                 handle.batch_generate_release(batch_request_id)
                 genparams.pop('_batch_request_id', None)
@@ -9407,14 +9502,31 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
     async def handle_request(self, genparams, api_format, stream_flag):
         tasks = []
         genparams["oai_uniqueid"] = random.randint(100000, 999999)
+        for key in ('_sse_stream_started', '_sse_stream_finished', '_oai_generation_pending', '_oai_generation_error', '_anthropic_stream_state'):
+            genparams.pop(key, None)
         monitor_task = None
+        tool_keepalive_task = None
+
+        async def run_generation():
+            try:
+                return await self.generate_text(genparams, api_format, stream_flag)
+            except Exception as ex:
+                if api_format not in (3, 4):
+                    raise
+                print(f"Generate: Error while generating: {ex}")
+                genparams['_oai_generation_error'] = True
+                handle.abort_generate()
+                return self.make_openai_generation_error()
+
         try:
             if stream_flag:
                 tasks.append(self.handle_sse_stream(genparams, api_format))
-            generate_task = asyncio.create_task(self.generate_text(genparams, api_format, stream_flag))
+            generate_task = asyncio.create_task(run_generation())
             tasks.append(generate_task)
             if stream_flag:
                 monitor_task = asyncio.create_task(self.monitor_connection(handle.abort_generate))
+                if api_format in (4, 7, 9) and genparams.get('using_openai_tools', False):
+                    tool_keepalive_task = asyncio.create_task(self.send_tool_stream_keepalives(genparams, api_format))
             await asyncio.gather(*tasks)
             generate_result = generate_task.result()
             return generate_result
@@ -9425,12 +9537,22 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
             await asyncio.sleep(0.1) #short delay
         except Exception as e:
             print(e)
+            if api_format in (3, 4):
+                handle.abort_generate()
+                return self.make_openai_generation_error()
         finally:
             if monitor_task and not monitor_task.done():
                 monitor_task.cancel()
                 try:
                     await monitor_task
                 except asyncio.CancelledError:
+                    pass
+            if tool_keepalive_task:
+                if not tool_keepalive_task.done():
+                    tool_keepalive_task.cancel()
+                try:
+                    await tool_keepalive_task
+                except (asyncio.CancelledError, OSError):
                     pass
 
     async def send_json_keepalives(self, cancel_fn, interval=50):
@@ -11730,6 +11852,18 @@ Change Mode<br>
                         modelNameToReturn = friendlymodelname
                         if autoswapmode and textName is not None:
                             modelNameToReturn = textName
+                        if api_format in (3, 4) and gendat and gendat.get('error'):
+                            genresp = json.dumps(gendat).encode()
+                            if genparams.get('_sse_stream_started', False):
+                                self.wfile.write(b'data: ' + genresp + b'\n\ndata: [DONE]\n\n')
+                                self.wfile.flush()
+                                self.close_connection = True
+                            else:
+                                self.send_response(500)
+                                self.send_header('content-length', str(len(genresp)))
+                                self.end_headers(content_type='application/json')
+                                self.wfile.write(genresp)
+                            return
                         # Headers are already sent when streaming
                         if not sse_stream_flag:
                             self.send_response(200)
@@ -11741,6 +11875,8 @@ Change Mode<br>
                             if genparams.get('tc_true_streamed', False):
                                 # True streaming already sent all chunks (meta, args, finish_reason, [DONE]) in handle_sse_stream
                                 self.close_connection = True
+                            elif genparams.get('_sse_stream_finished', False):
+                                return
                             else:
                                 # we only send content_text and reasoning_text if tools aren't used. they contain the balance of the output after sync_toolcall_potential_triggered was triggered
                                 content_text = genparams.get('sync_toolcall_extra_content', "") #populated by the sse call, we don't use gendat['choices'][0]['message'].get('content', None)
@@ -11786,12 +11922,18 @@ Change Mode<br>
 
                             elif api_format == 9: # Anthropic fake-stream for tool calls
                                 req_id_suffix = genparams.get('oai_uniqueid', 1)
-                                start_msg = {"type": "message", "id": f"msg_A{req_id_suffix}", "role": "assistant", "model": modelNameToReturn, "usage": {"input_tokens": 0, "output_tokens": 0}}
-                                self.wfile.write(f'event: message_start\ndata: {json.dumps({"type":"message_start","message":start_msg})}\n\n'.encode())
-                                block_index = 0
+                                message_started, block_index, block_open = genparams.get('_anthropic_stream_state', (False, 0, False))
+                                if not message_started:
+                                    start_msg = {"type": "message", "id": f"msg_A{req_id_suffix}", "role": "assistant", "model": modelNameToReturn, "content": [], "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": gendat['usage']['input_tokens'], "output_tokens": 0}}
+                                    self.wfile.write(f'event: message_start\ndata: {json.dumps({"type":"message_start","message":start_msg})}\n\n'.encode())
+                                if block_open:
+                                    self.wfile.write(f'event: content_block_stop\ndata: {json.dumps({"type":"content_block_stop","index":block_index})}\n\n'.encode())
+                                    block_index += 1
 
                                 # optional leading text (content that arrived before the tool tag)
                                 content_text = genparams.get('sync_toolcall_extra_content', "")
+                                if genparams.get('sync_toolcall_stream_ineligible', False):
+                                    content_text = ''.join(block.get('text', '') for block in gendat['content'] if block['type'] == 'text')
 
                                 # tool_use blocks
                                 if toolsdata_res and len(toolsdata_res) > 0:
@@ -11820,17 +11962,17 @@ Change Mode<br>
                                         block_index += 1
 
                                 stop_reason = "tool_use" if toolsdata_res else ("end_turn" if currfinishreason == "stop" else "max_tokens")
-                                usage_pp = handle.get_last_input_count()
-                                self.wfile.write(f'event: message_delta\ndata: {json.dumps({"type":"message_delta","delta":{"stop_reason":stop_reason,"stop_sequence":None},"usage":{"output_tokens":usage_pp}})}\n\n'.encode())
+                                self.wfile.write(f'event: message_delta\ndata: {json.dumps({"type":"message_delta","delta":{"stop_reason":stop_reason,"stop_sequence":None},"usage":gendat["usage"]})}\n\n'.encode())
                                 self.wfile.write(f'event: message_stop\ndata: {json.dumps({"type":"message_stop"})}\n\n'.encode())
                                 self.wfile.flush()
 
                             # OpenAI fake-stream path (format 4)
                             else:
-                                if genparams.get('sync_toolcall_first_role_sent', False): # Send role chunk first, if needed
+                                chatcmpl_id = gendat['id']
+                                if not genparams.get('sync_toolcall_first_role_sent', False): # Send role chunk first, if needed
                                     genparams['sync_toolcall_first_role_sent'] = True
                                     chunk_role = json.dumps({
-                                        "id": "koboldcpp",
+                                        "id": chatcmpl_id,
                                         "object": "chat.completion.chunk",
                                         "created": int(time.time()),
                                         "model": modelNameToReturn,
@@ -11864,7 +12006,7 @@ Change Mode<br>
 
                                     if temp_reasoning:
                                         chunk_content = json.dumps({
-                                            "id": "koboldcpp",
+                                            "id": chatcmpl_id,
                                             "object": "chat.completion.chunk",
                                             "created": int(time.time()),
                                             "model": modelNameToReturn,
@@ -11874,7 +12016,7 @@ Change Mode<br>
                                         self.wfile.flush()
                                     if temp_content:
                                         chunk_content = json.dumps({
-                                            "id": "koboldcpp",
+                                            "id": chatcmpl_id,
                                             "object": "chat.completion.chunk",
                                             "created": int(time.time()),
                                             "model": modelNameToReturn,
@@ -11896,7 +12038,7 @@ Change Mode<br>
                                             }
                                         }
                                         chunk_meta = json.dumps({
-                                            "id": "koboldcpp",
+                                            "id": chatcmpl_id,
                                             "object": "chat.completion.chunk",
                                             "created": int(time.time()),
                                             "model": modelNameToReturn,
@@ -11913,7 +12055,7 @@ Change Mode<br>
                                             "function": {"arguments": args_str}
                                         }
                                         chunk_args = json.dumps({
-                                            "id": "koboldcpp",
+                                            "id": chatcmpl_id,
                                             "object": "chat.completion.chunk",
                                             "created": int(time.time()),
                                             "model": modelNameToReturn,
@@ -11925,7 +12067,7 @@ Change Mode<br>
                                     # Send remaining buffered content if no tool calls were made
                                     if reasoning_text:
                                         chunk_content = json.dumps({
-                                            "id": "koboldcpp",
+                                            "id": chatcmpl_id,
                                             "object": "chat.completion.chunk",
                                             "created": int(time.time()),
                                             "model": modelNameToReturn,
@@ -11935,7 +12077,7 @@ Change Mode<br>
                                         self.wfile.flush()
                                     if content_text:
                                         chunk_content = json.dumps({
-                                            "id": "koboldcpp",
+                                            "id": chatcmpl_id,
                                             "object": "chat.completion.chunk",
                                             "created": int(time.time()),
                                             "model": modelNameToReturn,
@@ -11946,17 +12088,29 @@ Change Mode<br>
 
                                 # Final chunk
                                 chunk_final = json.dumps({
-                                    "id": "koboldcpp",
+                                    "id": chatcmpl_id,
                                     "object": "chat.completion.chunk",
                                     "created": int(time.time()),
                                     "model": modelNameToReturn,
-                                    "choices": [{"index": 0, "finish_reason": "tool_calls" if (len(toolsdata_res) > 0) else currfinishreason, "delta": {}}]
+                                    "choices": [{"index": 0, "finish_reason": gendat['choices'][0]['finish_reason'], "delta": {}}]
                                 })
                                 self.wfile.write(f"data: {chunk_final}\n\n".encode())
+                                strop = genparams.get("stream_options", None)
+                                if strop and strop.get("include_usage", False):
+                                    chunk_usage = json.dumps({
+                                        "id": chatcmpl_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": int(time.time()),
+                                        "model": modelNameToReturn,
+                                        "choices": [],
+                                        "usage": gendat["usage"]
+                                    })
+                                    self.wfile.write(f"data: {chunk_usage}\n\n".encode())
                                 self.wfile.write("data: [DONE]\n\n".encode())
                                 self.wfile.flush()
                             self.close_connection = True
                     except Exception as ex:
+                        self.close_connection = True
                         utfprint(ex,1)
                         print("Generate: The response could not be sent, maybe connection was terminated?")
                         handle.abort_generate()
@@ -12005,7 +12159,8 @@ Change Mode<br>
                         if override_abort_gen is not None and tryparseint(override_abort_gen, 1): #enable keepalive on poor connection mode
                             abort_gen = None
                             send_keepalive = True
-                        if tryparseint(genparams.get('frames', 1), 1) > 1: #enable keepalive if more than 1 frame
+                        # Cloudflare proxy heuristic, trigger keepalive if cloudflare is detected
+                        if self.headers.get('CF-Connecting-IP'):
                             send_keepalive = True
                         if send_keepalive:
                             # Close-delimited JSON works with HTTP/1.0 and HTTP/1.1.
@@ -12713,6 +12868,7 @@ def show_gui():
     # slider data
     batchsize_values = ["-1","16","32","64","128","256","512","1024","2048","4096"]
     batchsize_text = ["Don't Batch","16","32","64","128","256","512","1024","2048","4096"]
+    ubatchsize_text = ["Match Batch Size","16","32","64","128","256","512","1024","2048","4096"]
     contextsize_text = ["256", "512", "1024", "2048", "3072", "4096", "5120", "6144", "7168", "8192", "9216", "10240", "11264", "12288", "13312", "14336", "15360", "16384", "18432", "20480", "22528", "24576", "26624", "28672", "30720", "32768", "36864", "40960", "45056", "49152", "53248", "57344", "61440", "65536", "73728", "81920", "90112", "98304", "106496", "114688", "122880", "131072", "147456", "163840", "180224", "196608", "212992", "229376", "245760", "262144" ]
     quantkv_text = ["f16","bf16","q8_0","q5_1","q4_0"]
 
@@ -12735,7 +12891,6 @@ def show_gui():
     debugmode = ctk.IntVar()
     keepforeground = ctk.IntVar()
     terminalonly = ctk.IntVar()
-    pipelineparallel = ctk.IntVar(value=1)
     quietmode = ctk.IntVar(value=0)
     nocertifymode = ctk.IntVar(value=0)
 
@@ -12744,6 +12899,7 @@ def show_gui():
     quantkv_var = ctk.IntVar(value=0)
     blas_threads_var = ctk.StringVar()
     blas_size_var = ctk.IntVar()
+    ubatch_size_var = ctk.IntVar()
     autofit_var = ctk.IntVar()
     tensor_split_str_vars = ctk.StringVar(value="")
     splitmode_var = ctk.StringVar(value=splitmode_choices[0])
@@ -12967,16 +13123,23 @@ def show_gui():
             temp.bind("<Leave>", hide_tooltip)
         return temp
 
-    def makeslider(parent, label, options, var, row=0, width=160, height=10, set=0, tooltip=""):
-        sliderLabel = makelabel(parent, options[set], row + 1, 0, columnspan=2, padx=(width+12))
-        titleLabel = makelabel(parent, label, row,0,tooltip)
+    def makeslider(parent, label, options, var, row=0, width=160, height=12, set=0, tooltip=""):
+        slider_row = ctk.CTkFrame(parent, fg_color="transparent")
+        slider_row.grid(row=row, column=0, columnspan=2, padx=8, sticky="w")
+        titleLabel = ctk.CTkLabel(slider_row, text=label)
+        titleLabel.grid(row=0, column=0, padx=(0, 8), sticky="w")
+        if tooltip:
+            titleLabel.bind("<Enter>", lambda event: show_tooltip(event, tooltip))
+            titleLabel.bind("<Leave>", hide_tooltip)
+        sliderLabel = ctk.CTkLabel(slider_row, text=options[set])
+        sliderLabel.grid(row=0, column=2, sticky="w")
         from_ = 0
         to = len(options)-1
         def sliderUpdate(a,b,c):
             sliderLabel.configure(text = options[int(var.get())])
         var.trace_add("write", sliderUpdate)
-        slider = ctk.CTkSlider(parent, from_=from_, to=to, variable = var, width = width, height=height, border_width=5,number_of_steps=len(options) - 1)
-        slider.grid(row=row+1,  column=0, padx = 8, stick="w", columnspan=2)
+        slider = ctk.CTkSlider(slider_row, from_=from_, to=to, variable=var, width=width, height=height, border_width=5, number_of_steps=len(options) - 1)
+        slider.grid(row=0, column=1, padx=(2, 8), sticky="w")
         slider.set(set)
         return slider, sliderLabel, titleLabel
 
@@ -13069,7 +13232,7 @@ def show_gui():
             try:
                 selected_index = searchbox2.cget("values").index(modelsearch2_var.get())
                 pickedsize = searchedsizes[selected_index]
-                fileinfotxt_var.set(f"Size: {round(pickedsize/1024/1024/1024,2)} GB")
+                fileinfotxt_var.set(f"Size: {round(pickedsize/1024/1024/1024,2)} GiB" if pickedsize is not None else "Size: Unknown (missing file metadata or parts)")
             except Exception:
                 fileinfotxt_var.set("")
         def fetch_search_quants(a,b,c):
@@ -13079,13 +13242,22 @@ def show_gui():
                     return
                 searchedmodels = []
                 searchedsizes = []
-                resp = make_url_request(f"https://huggingface.co/api/models/{modelsearch1_var.get()}/tree/main?recursive=true",None,'GET',{},10)
-                for m in resp:
-                    if m["type"]=="file" and ".gguf" in m["path"]:
-                        if "-of-0" in m["path"] and "00001" not in m["path"]:
+                # Model metadata includes all files, avoiding a truncated tree page.
+                resp = make_url_request(f"https://huggingface.co/api/models/{modelsearch1_var.get()}/revision/main?blobs=true",None,'GET',{},10)
+                files = {m["rfilename"]: m.get("size") for m in resp["siblings"]}
+                for filename, size in files.items():
+                    if not filename.lower().endswith(".gguf"):
+                        continue
+                    match = re.search(r'-(\d{5})-of-(\d{5})\.gguf$', filename, re.IGNORECASE)
+                    if match:
+                        if int(match.group(1)) != 1:
                             continue
-                        searchedmodels.append(m["path"])
-                        searchedsizes.append(m["size"])
+                        # Sum actual sizes: the final shard is usually smaller.
+                        sizes = [files.get(filename[:match.start(1)] + f"{part:05d}" + filename[match.end(1):])
+                                 for part in range(1, int(match.group(2)) + 1)]
+                        size = sum(sizes) if sizes and all(s is not None for s in sizes) else None
+                    searchedmodels.append(filename)
+                    searchedsizes.append(size)
                 searchbox2.configure(values=searchedmodels)
                 if len(searchedmodels)>0:
                     quants = ["q4k","q4_k","q4", "q3", "q5", "q6", "q8"] #autopick priority
@@ -13119,18 +13291,19 @@ def show_gui():
                 searchbox1.configure(values=[])
                 searchbox2.configure(values=[])
                 searchedmodels = []
-                searchbase = model_search.get()
-                if searchbase.strip()=="":
+                searchbase = model_search.get().strip()
+                if searchbase=="":
                     return
-                urlcode = urllib.parse.urlencode({"search":( "GGUF " + searchbase),"limit":10}, doseq=True)
-                urlcode2 = urllib.parse.urlencode({"search":searchbase,"limit":6}, doseq=True)
+                urlcode = urllib.parse.urlencode({"search":searchbase,"filter":"gguf","limit":100}, doseq=True)
+                urlcode2 = urllib.parse.urlencode({"search":searchbase,"limit":100}, doseq=True)
                 resp = make_url_request(f"https://huggingface.co/api/models?{urlcode}",None,'GET',{},10)
                 for m in resp:
                     searchedmodels.append(m["id"])
-                if len(resp)<=3: #too few results, repeat search without GGUF in the string
+                if len(resp)<=3: # Include repositories whose GGUF tag is missing.
                     resp2 = make_url_request(f"https://huggingface.co/api/models?{urlcode2}",None,'GET',{},10)
                     for m in resp2:
-                        searchedmodels.append(m["id"])
+                        if m["id"] not in searchedmodels:
+                            searchedmodels.append(m["id"])
 
                 if len(searchedmodels)==0:
                     messagebox.showinfo("No Results Found", "Search found no results")
@@ -13523,7 +13696,6 @@ def show_gui():
         "Direct I/O": [usedirectio, "Use direct I/O when loading GGUF models. May improve cold-load times on some storage."],
         "Keep Foreground": [keepforeground, "Bring KoboldCpp to the foreground every time there is a new generation."],
         "CLI Terminal Only": [terminalonly, "Does not launch KoboldCpp HTTP server. Instead, enables KoboldCpp from the command line, accepting interactive console input and displaying responses to the terminal."],
-        "Pipeline Parallel": [pipelineparallel, "Enable Pipeline Parallelism for faster multigpu speeds but using more memory, only active for multigpu."],
     }
 
     for idx, (name, properties) in enumerate(hardware_boxes.items()):
@@ -13532,6 +13704,21 @@ def show_gui():
     # blas batch size
     makeslider(hardware_tab, "Batch Size:", batchsize_text, blas_size_var, 16,width=200, set=6,tooltip="How many tokens to process at once per batch.\nLarger values use more memory.")
     blas_size_var.trace_add("write", changed_gpulayers_estimate)
+    ubatch_slider, _, _ = makeslider(hardware_tab, "Physical Batch Size:", ubatchsize_text, ubatch_size_var, 17,width=200, set=0,tooltip="How many tokens to process at once in each physical batch.\nThe default matches Batch Size. Smaller values may use less memory.")
+
+    def update_ubatch_limit(*unused):
+        batch_index = blas_size_var.get()
+        # A batch size of -1 disables batching, so only the default is applicable.
+        ubatch_slider.configure(to=max(1, batch_index), number_of_steps=max(1, batch_index), state="normal" if batch_index else "disabled")
+        ubatch_slider.set(min(ubatch_size_var.get(), batch_index))
+
+    def clamp_ubatch_size(*unused):
+        if ubatch_size_var.get() > blas_size_var.get():
+            ubatch_slider.set(blas_size_var.get())
+
+    blas_size_var.trace_add("write", update_ubatch_limit)
+    ubatch_size_var.trace_add("write", clamp_ubatch_size)
+    update_ubatch_limit()
 
     makecheckbox(hardware_tab, "Use FlashAttention", flashattention_var, 100, command=toggleflashattn,  tooltiptxt="Enable flash attention for GGUF models.")
 
@@ -13583,7 +13770,7 @@ def show_gui():
     manualropebox = makecheckbox(context_tab, "Manual Rope Scale", variable=manualrope_var, row=22, command=togglerope, padx=(200), tooltiptxt="Set RoPE base and scale manually.")
 
     makecheckbox(context_tab, "Custom RoPE Config", variable=customrope_var, row=22, command=togglerope,tooltiptxt="Override the default RoPE configuration with custom RoPE scaling.")
-    noqkvlabel = makelabel(context_tab,"(Note: QuantKV works best with flash attention)",30,0,"Only K cache can be quantized, and performance can suffer.\nIn some cases, it might even use more VRAM when doing a full offload.",padx=160)
+    noqkvlabel = makelabel(context_tab,"(Note: QuantKV works best with flash attention)",31,0,"Only K cache can be quantized, and performance can suffer.\nIn some cases, it might even use more VRAM when doing a full offload.")
     noqkvlabel.configure(text_color="#ff5555")
     qkvslider,qkvlabel,qkvtitle = makeslider(context_tab, "Quantize KV Cache:", quantkv_text, quantkv_var, 30, set=0,tooltip="Enable quantization of KV cache.\nRequires Flash Attention for full effect, otherwise only K cache is quantized.")
     quantkv_var.trace_add("write", toggleflashattn)
@@ -13658,7 +13845,7 @@ def show_gui():
     jinja_think_choices = ['default', 'true', 'false']
     jinjathinkbox, jinjathinklbl = makelabelcombobox(context_tab, "Jinja Thinking:", jinja_think_var, 45, command=togglejinjathink,labelpadx=(280), padx=370, width=100, tooltiptxt="Tries to enable or disable thinking in Jinja mode. This is a shortcut to setting Jinja Kwargs directly.", values=jinja_think_choices)
     jinjakwargsbox,jinjakwargsboxlbl = makelabelentry(context_tab, "Jinja Kwargs:", jinja_kwargs_var, row=47, width=160, labelpadx=(210), padx=(300), singleline=True, tooltip='Set additiona fields for Jinja JSON template parser, must be a valid json object.\nSpecified as JSON fields: {"KEY1":"VALUE1", "KEY2":"VALUE2"...}')
-    think_effort_choices = ['default', 'high', 'medium', 'low', 'minimal', 'none']
+    think_effort_choices = ['default', 'xhigh', 'high', 'medium', 'low', 'minimal', 'none']
     makelabelcombobox(context_tab, "Think Effort:", think_effort_var, 47, command=togglethinkeffort, padx=84, width=100, tooltiptxt="Set the default thinking effort, can be overridden by the API.", values=think_effort_choices)
     jinja_stream_toolcall_box = makecheckbox(context_tab, "Stream ToolCalls", jinja_stream_toolcall_var, row=49, tooltiptxt="When jinja tool calls are active, stream the tool call content as tokens are generated rather than buffering silently until generation is complete.")
     jinja_var.trace_add("write", togglejinja)
@@ -14108,7 +14295,6 @@ def show_gui():
         args.remotetunnel = remotetunnel_var.get()==1
         args.foreground = keepforeground.get()==1
         args.cli = terminalonly.get()==1
-        args.nopipelineparallel = pipelineparallel.get()==0
         args.quiet = quietmode.get()==1
         args.nocertify = nocertifymode.get()==1
         args.nomodel = nomodel.get()==1
@@ -14174,6 +14360,7 @@ def show_gui():
         args.blasthreads = None if blas_threads_var.get()=="" else int(blas_threads_var.get())
         args.device = deviceoverride_var.get()
         args.batchsize = int(batchsize_values[int(blas_size_var.get())])
+        args.ubatchsize = int(batchsize_values[int(ubatch_size_var.get())])
         args.autofit = autofit_var.get() == 1
         args.contextsize = int(contextsize_text[context_var.get()])
         if customrope_var.get()==1:
@@ -14383,7 +14570,6 @@ def show_gui():
         remotetunnel_var.set(1 if "remotetunnel" in mydict and mydict["remotetunnel"] else 0)
         keepforeground.set(1 if "foreground" in mydict and mydict["foreground"] else 0)
         terminalonly.set(1 if "cli" in mydict and mydict["cli"] else 0)
-        pipelineparallel.set(0 if "nopipelineparallel" in mydict and mydict["nopipelineparallel"] else 1)
         quietmode.set(1 if "quiet" in mydict and mydict["quiet"] else 0)
         nocertifymode.set(1 if "nocertify" in mydict and mydict["nocertify"] else 0)
         nomodel.set(1 if "nomodel" in mydict and mydict["nomodel"] else 0)
@@ -14527,6 +14713,10 @@ def show_gui():
 
         if "batchsize" in mydict and mydict["batchsize"]:
             blas_size_var.set(batchsize_values.index(str(mydict["batchsize"])))
+        if "ubatchsize" in mydict and mydict["ubatchsize"] is not None:
+            ubatch_size_var.set(batchsize_values.index(str(mydict["ubatchsize"])))
+        else:
+            ubatch_size_var.set(0)
 
         autofit_var.set(1 if "autofit" in mydict and mydict["autofit"] else 0)
         model_var.set(mydict["model_param"] if ("model_param" in mydict and mydict["model_param"]) else "")
@@ -17461,7 +17651,8 @@ if __name__ == '__main__':
     advparser.add_argument("--analyze", metavar=('[filename]'), help="Reads the metadata, weight types and tensor names in any GGUF or safetensors file.", default="")
     advparser.add_argument("--autofit","--fit","-fit", help="Forces autofit, which attempts to fit the model in the best possible way. Overrides everything else.", action='store_true')
     advparser.add_argument("--autofitpadding", metavar=('[padding in MB]'), help="How much spare allowance in MB should autofit reserve? If it's too little, the load might fail.", type=int, default=default_autofit_padding)
-    advparser.add_argument("--batchsize","--blasbatchsize","--batch-size","-b", help="Sets the batch size used in batched processing (default 512). Setting it to -1 disables batched mode, but keeps other benefits like GPU offload.", type=int,choices=[-1,16,32,64,128,256,512,1024,2048,4096], default=512)
+    advparser.add_argument("--batchsize","--blasbatchsize","--batch-size","-b", help="Sets the logical batch size used in batched processing (default 512). Setting it to -1 disables batched mode, but keeps other benefits like GPU offload.", type=int,choices=[-1,16,32,64,128,256,512,1024,2048,4096], default=512)
+    advparser.add_argument("--ubatchsize","--ubatch-size","-ub", help="Sets the physical batch size used in batched processing. Setting it to -1 uses the same value as batchsize (default).", type=int,choices=[-1,16,32,64,128,256,512,1024,2048,4096], default=-1)
     advparser.add_argument("--benchmark", help="Do not start server, instead run benchmarks. If filename is provided, appends results to provided file.", metavar=('[filename]'), nargs='?', const="stdout", type=str, default=None)
     advparser.add_argument("--blasthreads","--batchthreads","--threadsbatch","--threads-batch", help="Use a different number of threads during batching if specified. Otherwise, has the same value as --threads",metavar=('[threads]'), type=int, default=0)
     advparser.add_argument("--chatcompletionsadapter", metavar=('[filename]'), help="Select an optional ChatCompletions Adapter JSON file to force custom instruct tags.", default="AutoGuess")
@@ -17510,7 +17701,6 @@ if __name__ == '__main__':
     advparser.add_argument("--nobostoken", help="Prevents BOS token from being added at the start of any prompt. Usually NOT recommended for most models.", action='store_true')
     advparser.add_argument("--nommq", help="Disables MMQ, only used for cuda backend. This flag may be removed in future.", action='store_true')
     advparser.add_argument("--nomodel", help="Allows you to launch the GUI alone, without selecting any model.", action='store_true')
-    advparser.add_argument("--nopipelineparallel", help="Disable Pipeline Parallelism. Pipeline Parallelism provides faster multigpu speeds but using more memory, only active for multigpu.", action='store_true')
     advparser.add_argument("--noshift","--no-context-shift", help="If set, do not attempt to Trim and Shift the GGUF context.", action='store_true')
     advparser.add_argument("--noswa","--swa-full", help="If set, uses full-size SWA KV Cache. Otherwise, SWA will be enabled automatically on models that support it. SWA saves memory but cannot be used with context shifting.", action='store_true')
     advparser.add_argument("--onready", help="An optional shell command to execute after the model has been loaded.", metavar=('[shell command]'), type=str, default="")
@@ -17529,7 +17719,7 @@ if __name__ == '__main__':
     advparser.add_argument("--quantkv", help="Sets the KV cache data type quantization, options are f16/bf16/q8_0/q5_1/q4_0. Requires Flash Attention for full effect, otherwise only K cache is quantized.",metavar=('[quantization level f16/bf16/q8_0/q5_1/q4_0]'), type=str, choices=["f16","bf16","q8_0","q5_1","q4_0","0","1","2","3"], default="f16")
     advparser.add_argument("--quiet", help="Enable quiet mode, which hides generation inputs and outputs in the terminal. Quiet mode is automatically enabled when running a horde worker.", action='store_true')
     advparser.add_argument("--ratelimit", metavar=('[seconds]'), help="If enabled, rate limit generative request by IP address. Each IP can only send a new request once per X seconds.", type=int, default=0)
-    advparser.add_argument("--reasoningeffort", help="A quick way to set the default reasoning effort. API values override this.", type=str, choices=['default','none','low','medium','high'], default="default")
+    advparser.add_argument("--reasoningeffort", help="A quick way to set the default reasoning effort. API values override this.", type=str, choices=['default','none','low','medium','high','xhigh'], default="default")
     advparser.add_argument("--remotetunnel", help="Uses Cloudflare to create a remote tunnel, allowing you to access koboldcpp remotely over the internet even behind a firewall.", action='store_true')
     advparser.add_argument("--ropeconfig", help="If set, uses customized RoPE scaling from configured frequency scale and frequency base (e.g. --ropeconfig 0.25 10000). Otherwise, uses NTK-Aware scaling set automatically based on context size. For linear rope, simply set the freq-scale and ignore the freq-base",metavar=('[rope-freq-scale]', '[rope-freq-base]'), default=[0.0, 10000.0], type=float, nargs='+')
     advparser.add_argument("--savedatafile", metavar=('[savefile]'), help="If enabled, creates or opens a persistent database file on the server, that allows users to save and load their data remotely. A new file is created if it does not exist.", default="")
@@ -17655,6 +17845,7 @@ if __name__ == '__main__':
     deprecatedgroup.add_argument("--sdconfig", help=argparse.SUPPRESS, nargs='+')
     compatgroup.add_argument("--noblas", help=argparse.SUPPRESS, action='store_true')
     compatgroup3.add_argument("--nommap","--no-mmap", help=argparse.SUPPRESS, action='store_true')
+    deprecatedgroup.add_argument("--nopipelineparallel", help=argparse.SUPPRESS, action='store_true') #now to automatically enable when ubatch < batchsize and multigpu
     deprecatedgroup.add_argument("--pipelineparallel", help=argparse.SUPPRESS, action='store_true') #changed to nopipelineparallel
     deprecatedgroup.add_argument("--sdnotile", help=argparse.SUPPRESS, action='store_true') # legacy option, see sdtiledvae
     deprecatedgroup.add_argument("--sdvaecpu", help=argparse.SUPPRESS, action='store_true') # legacy option, see sdvaedevice
