@@ -1082,7 +1082,11 @@ let getLastActions = (amountOfActions = 10, excludeSpecificMessagePrefixes = [])
     let exclusions = ["Chain of thought repetition detected - ending", "Chain of thought complete", "plan_actions"]
     // , "Action: {", "Action (words =", "Action taken: ", "Action taken (words ="
     // "Action: {", "Action (words =", "Action taken: ", "Action taken (words ="
-    return repack_instruct_turns(handleReasoningStripping(concat_gametext(true)), `{{[INPUT]}}`, `{{[OUTPUT]}}`, `{{[SYSTEM]}}`, true, false, excludeSpecificMessagePrefixes).map(msg => {
+
+    let gametext = concat_gametext(true)
+    gametext = handleReasoningStripping(gametext || "");
+    gametext = cropToTurnBoundaryMax(gametext);
+    return repack_instruct_turns(gametext, `{{[INPUT]}}`, `{{[OUTPUT]}}`, `{{[SYSTEM]}}`, true, false, excludeSpecificMessagePrefixes).map(msg => {
         msg.msg = msg.msg.replaceAll("{{[SYSTEM_END]}}", "").replaceAll("{{[INPUT_END]}}", "").replaceAll("{{[OUTPUT_END]}}", "").trim();
         return msg
     }).filter(msg => !/^\n*$/.test(msg.msg) && !!msg.msg && !exclusions.find(exclusion => msg.msg.indexOf(exclusion) !== -1)).splice(-amountOfActions)
