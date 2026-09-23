@@ -938,6 +938,39 @@ let quickStartSelection = {
 
 window.quickStartLibrarySelectionContext = null
 
+// Extension hook: lets mods add their own optional sections to Quick Start.
+// ext = {
+//     id, label, helpText,
+//     render(containerElem, rerender),  // builds the section body; call rerender() after changes
+//     hasSelection(),                  // true if the extension has something to apply
+//     apply(),                         // may be async; runs after the built-in selections
+//     clear()                          // called by "Clear all"
+// }
+let quickStartExtensionList = []
+window.quickStartExtensions = {
+    register: (ext) => {
+        if (!ext?.id || quickStartExtensionList.some(curr => curr.id === ext.id)) {
+            return false
+        }
+        quickStartExtensionList.push(ext)
+        return true
+    },
+    unregister: (id) => {
+        quickStartExtensionList = quickStartExtensionList.filter(curr => curr.id !== id)
+    },
+    list: () => quickStartExtensionList.map(curr => curr.id)
+}
+
+let doesQuickStartExtensionHaveSelection = (ext) => {
+    try {
+        return !!ext.hasSelection?.()
+    }
+    catch (e) {
+        console.error(e)
+        return false
+    }
+}
+
 let getQuickStartSelectionForRole = (role) => {
     if (!Object.prototype.hasOwnProperty.call(quickStartSelection, role)) {
         return []
@@ -960,6 +993,14 @@ let clearQuickStartSelectionForRole = (role) => {
 
 let clearAllQuickStartSelections = () => {
     Object.keys(QUICK_START_SELECTION_CONFIG).forEach(role => clearQuickStartSelectionForRole(role))
+    quickStartExtensionList.forEach(ext => {
+        try {
+            ext.clear?.()
+        }
+        catch (e) {
+            console.error(e)
+        }
+    })
 }
 
 let toggleQuickStartSelectionForRole = (role, name) => {
@@ -989,6 +1030,7 @@ let toggleQuickStartSelectionForRole = (role, name) => {
 
 let doesQuickStartHaveSelections = () => {
     return Object.keys(QUICK_START_SELECTION_CONFIG).some(role => getQuickStartSelectionForRole(role).length > 0)
+        || quickStartExtensionList.some(ext => doesQuickStartExtensionHaveSelection(ext))
 }
 
 let loadWorldInfoFromLibraryByName = async (name) => {
@@ -1116,6 +1158,20 @@ let applyQuickStartSelection = async () => {
                 render_gametext(true)
             }
             catch (e) {
+                console.error(e)
+            }
+        }
+
+        for (let i = 0; i < quickStartExtensionList.length; i++) {
+            let ext = quickStartExtensionList[i]
+            if (!doesQuickStartExtensionHaveSelection(ext)) {
+                continue
+            }
+            try {
+                await ext.apply?.()
+            }
+            catch (e) {
+                nonFatalErrors.push(`${ext.label || ext.id}: ${e?.message || e}`)
                 console.error(e)
             }
         }
@@ -1269,6 +1325,7 @@ let showQuickStartPopup = () => {
     let totalSelected = Object.keys(QUICK_START_SELECTION_CONFIG)
         .map(role => getQuickStartSelectionForRole(role).length)
         .reduce((sum, count) => sum + count, 0)
+        + quickStartExtensionList.filter(ext => doesQuickStartExtensionHaveSelection(ext)).length
 
     createSection(contents, "Note", "Selections are optional. Use Library to select / deselect items. You can import from Library and then return here.")
     createSection(contents, "Selected items", `${totalSelected}`)
@@ -1277,6 +1334,23 @@ let showQuickStartPopup = () => {
     addChooserSection("additionalCharacters", "Additional characters in scene")
     addChooserSection("playerCharacter", "Player character")
     addChooserSection("worldInfo", "World info / lorebook entries")
+
+    quickStartExtensionList.forEach(ext => {
+        let sectionWrap = document.createElement("div")
+        sectionWrap.style.width = "100%"
+        sectionWrap.style.display = "flex"
+        sectionWrap.style.flexDirection = "column"
+        sectionWrap.style.gap = "8px"
+        sectionWrap.dataset.quickStartExtension = ext.id
+        try {
+            ext.render(sectionWrap, showQuickStartPopup)
+        }
+        catch (e) {
+            console.error(e)
+            return
+        }
+        createQuickStartSection(ext.label || ext.id, ext.helpText || "", sectionWrap)
+    })
 
     popupUtils.reset().title("Quick Start").content(contents).css("min-height", "50%").css("min-width", "60%")
         .button("Confirm", async () => {
