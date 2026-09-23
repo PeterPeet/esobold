@@ -7783,57 +7783,57 @@ class KcppProxyHandler(http.server.BaseHTTPRequestHandler):
                     musicReqs = ["/api/extra/music/prepare","/api/extra/music/generate"]
                     imageReqs = ["/images/generations", "/v1/images/generations", "/images/edits", "/v1/images/edits", "/sdapi/v1/txt2img", "/sdapi/v1/img2img", "/sdapi/v1/upscale"] # "/sdapi/v1/sd-models", "/sdapi/v1/options", "/sdapi/v1/samplers"
 
-                requestedType = None
+                    requestedType = None
 
-                autoswapSettings = global_memory["autoswapSettings"]
-                skipTextUnload = autoswapSettings.get("skipTextUnload", False)
-                skipTTSUnload = autoswapSettings.get("skipTTSUnload", False)
-                skipSSTUnload = autoswapSettings.get("skipSSTUnload", False)
-                skipEmbedUnload = autoswapSettings.get("skipEmbedUnload", False)
-                skipMusicUnload = autoswapSettings.get("skipMusicUnload", False)
-                skipImageUnload = autoswapSettings.get("skipImageUnload", False)
+                    autoswapSettings = global_memory["autoswapSettings"]
+                    skipTextUnload = autoswapSettings.get("skipTextUnload", False)
+                    skipTTSUnload = autoswapSettings.get("skipTTSUnload", False)
+                    skipSSTUnload = autoswapSettings.get("skipSSTUnload", False)
+                    skipEmbedUnload = autoswapSettings.get("skipEmbedUnload", False)
+                    skipMusicUnload = autoswapSettings.get("skipMusicUnload", False)
+                    skipImageUnload = autoswapSettings.get("skipImageUnload", False)
 
-                if not skipTextUnload and any(clean_path.endswith(e) for e in textReqs):
-                    requestedType = "text"
-                elif not skipSSTUnload and any(clean_path.endswith(e) for e in sttReqs):
-                    requestedType = "stt"
-                elif not skipTTSUnload and any(clean_path.endswith(e) for e in ttsReqs):
-                    requestedType = "tts"
-                elif not skipEmbedUnload and any(clean_path.endswith(e) for e in embedReqs):
-                    requestedType = "embed"
-                elif not skipMusicUnload and any(clean_path.endswith(e) for e in musicReqs):
-                    requestedType = "music"
-                elif not skipImageUnload and any(clean_path.endswith(e) for e in imageReqs):
-                    requestedType = "image"
+                    if not skipTextUnload and any(clean_path.endswith(e) for e in textReqs):
+                        requestedType = "text"
+                    elif not skipSSTUnload and any(clean_path.endswith(e) for e in sttReqs):
+                        requestedType = "stt"
+                    elif not skipTTSUnload and any(clean_path.endswith(e) for e in ttsReqs):
+                        requestedType = "tts"
+                    elif not skipEmbedUnload and any(clean_path.endswith(e) for e in embedReqs):
+                        requestedType = "embed"
+                    elif not skipMusicUnload and any(clean_path.endswith(e) for e in musicReqs):
+                        requestedType = "music"
+                    elif not skipImageUnload and any(clean_path.endswith(e) for e in imageReqs):
+                        requestedType = "image"
 
-                # A worker may contain several below-threshold model families. Only
-                # restart when the requested family is neither resident nor the
-                # family most recently requested for this configuration.
-                loadedReqTypes = list(global_memory.get("loadedReqTypes", []))
-                swapModeChanged = (requestedType is not None
-                    and requestedType not in loadedReqTypes
-                    and requestedType != global_memory["swapReqType"])
-                if swapModeChanged:
-                    global_memory["swapReqType"] = requestedType
+                    # A worker may contain several below-threshold model families. Only
+                    # restart when the requested family is neither resident nor the
+                    # family most recently requested for this configuration.
+                    loadedReqTypes = list(global_memory.get("loadedReqTypes", []))
+                    swapModeChanged = (requestedType is not None
+                        and requestedType not in loadedReqTypes
+                        and requestedType != global_memory["swapReqType"])
+                    if swapModeChanged:
+                        global_memory["swapReqType"] = requestedType
 
-                if (global_memory["swapReqType"] is not None and swapModeChanged):
-                    global_memory["triggered_sleeping"] = False
-                    reqbody = json.dumps({"filename":global_memory["current_model"], "baseconfig": global_memory["base_config"], "modelName": global_memory["current_model_override"]})
-                    reqheaders = {
-                        'Content-Type': 'application/json',
-                        'Content-Length': str(len(reqbody)),
-                    }
-                    if args.adminpassword:
-                        reqheaders["Authorization"] = f"Bearer {args.adminpassword}"
-                    conn = http.client.HTTPConnection('localhost', upstream_port, timeout=args.reqtimeout)
-                    conn.request("POST", "/api/admin/reload_config", body=reqbody, headers=reqheaders)
-                    resp = conn.getresponse()
-                    time.sleep(3)
-                    global_memory["last_active_timestamp"] = datetime.now()
-                    if not self.wait_for_upstream_ready(upstream_port,120,0.5):
-                        self.send_error(504, "KoboldCpp model swap reload timed out")
-                        return
-                    time.sleep(0.1)
+                    if (global_memory["swapReqType"] is not None and swapModeChanged):
+                        global_memory["triggered_sleeping"] = False
+                        reqbody = json.dumps({"filename":global_memory["current_model"], "baseconfig": global_memory["base_config"], "modelName": global_memory["current_model_override"]})
+                        reqheaders = {
+                            'Content-Type': 'application/json',
+                            'Content-Length': str(len(reqbody)),
+                        }
+                        if args.adminpassword:
+                            reqheaders["Authorization"] = f"Bearer {args.adminpassword}"
+                        conn = http.client.HTTPConnection('localhost', upstream_port, timeout=args.reqtimeout)
+                        conn.request("POST", "/api/admin/reload_config", body=reqbody, headers=reqheaders)
+                        resp = conn.getresponse()
+                        time.sleep(3)
+                        global_memory["last_active_timestamp"] = datetime.now()
+                        if not self.wait_for_upstream_ready(upstream_port,120,0.5):
+                            self.send_error(504, "KoboldCpp model swap reload timed out")
+                            return
+                        time.sleep(0.1)
 
         try:  # connect upstream
             conn = http.client.HTTPConnection(target_host, target_port, timeout=args.reqtimeout)
@@ -16849,7 +16849,7 @@ def build_autoswap_settings(args):
     }
 
 
-def disableSwappedFieldsInConfig(args, swapReqType):
+def disableSwappedFieldsInConfig(args, swapReqType, autoswap_settings):
     threshold_mb = max(0, getattr(args, "autoswapthreshold", default_autoswap_threshold))
     threshold_bytes = threshold_mb * 1024 * 1024
     configured_types = getAutoswapModelTypes(args)
@@ -16866,17 +16866,17 @@ def disableSwappedFieldsInConfig(args, swapReqType):
     print(f"Swapping to type: {swapReqType}; resident types: {', '.join(sorted(keep_types)) or 'none'} (threshold {threshold_mb} MB)")
     for model_type, fields in autoswap_model_fields.items():
         if model_type not in keep_types:
-            if model_type == "text" and skipTextUnload:
+            if model_type == "text" and autoswap_settings.get("skipTextUnload", False):
                 continue
-            if model_type == "stt" and skipSSTUnload:
+            if model_type == "stt" and autoswap_settings.get("skipSSTUnload", False):
                 continue
-            if model_type == "tts" and skipTTSUnload:
+            if model_type == "tts" and autoswap_settings.get("skipTTSUnload", False):
                 continue
-            if model_type == "embed" and skipEmbedUnload:
+            if model_type == "embed" and autoswap_settings.get("skipEmbedUnload", False):
                 continue
-            if model_type == "music" and skipMusicUnload:
+            if model_type == "music" and autoswap_settings.get("skipMusicUnload", False):
                 continue
-            if model_type == "image" and skipImageUnload:
+            if model_type == "image" and autoswap_settings.get("skipImageUnload", False):
                 continue
             for field in fields:
                 setattr(args, field, "")
