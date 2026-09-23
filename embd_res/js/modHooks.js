@@ -142,7 +142,7 @@ class QuickStartExtension extends EsoExtension {
         return this.invokeIfPresent("_hasSelection") || false
     }
 
-    apply() {
+    async apply() {
         return this.invokeIfPresent("_apply")
     }
 

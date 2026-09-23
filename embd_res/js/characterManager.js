@@ -1122,13 +1122,14 @@ let applyQuickStartSelection = async () => {
             }
         }
 
-        window.eso.extensions.getByType(EsoExtensionType.QUICK_START).filter(ext => ext.hasSelection()).forEach(ext => {
+        let quickStartExtensions = window.eso.extensions.getByType(EsoExtensionType.QUICK_START).filter(ext => ext.hasSelection())
+        for (let ext of quickStartExtensions) {
             ext.clearErrors();
-            ext.apply();
+            await ext.apply();
             if (ext.getErrors().length > 0) {
-                nonFatalErrors.push(...ext.getErrors());
+                nonFatalErrors.push(...ext.getErrors().map(e => `${ext.getLabel() || ext.getId()}: ${e?.message || e}`))
             }
-        })
+        }
     }
     finally {
         waitingToast.hide()
