@@ -37,6 +37,7 @@ import random
 import hashlib
 import urllib.parse
 import urllib.request
+import shlex
 import mimetypes
 import posixpath
 import zipfile
@@ -73,13 +74,14 @@ default_sdvaedevice = 'main'
 default_sdclipdevice = 'CPU'
 default_native_ctx = 16384
 default_genlen = 2048
+default_autoswap_threshold = 256
 overridekv_max = 16
 default_autofit_padding = 1024
 lora_filenames_max = 10
 multiuser_concurrent_limit = 10
 swa_padding_default = 0
 default_reqtimeout = 600 # 10 min default
-default_maxctx = 12288
+default_maxctx = 16384
 
 # abuse prevention
 stop_token_max = 256
@@ -89,10 +91,10 @@ dry_seq_break_max = 128
 extra_images_max = 4 # for kontext/qwen img
 
 # global vars
-KcppVersion = "1.121"
+KcppVersion = "1.122"
 showdebug = True
 kcpp_instance = None #global running instance
-global_memory = {"tunnel_url": "", "restart_target":"", "input_to_exit":False, "load_complete":False, "restart_model": "", "currentConfig": None, "currentBaseConfig": None, "modelOverride": None, "currentModel": None, "last_active_timestamp":datetime.now(), "triggered_sleeping":False, "current_model":"initial_model", "base_config":"", "swapReqType": None, "autoswapmode": False, "autoswapSettings": {}, "fs": {"files": {}, "current_size_bytes": 0, "max_size_bytes": 0, "source_dir": "", "mode": "memory", "initialized": False}, "restart_override_base_config": "", "current_model_override": "", "OpenLumara": False}
+global_memory = {"tunnel_url": "", "restart_target":"", "input_to_exit":False, "load_complete":False, "restart_model": "", "currentConfig": None, "currentBaseConfig": None, "modelOverride": None, "currentModel": None, "last_active_timestamp":datetime.now(), "triggered_sleeping":False, "current_model":"initial_model", "base_config":"", "swapReqType": None, "loadedReqTypes": [], "autoswapmode": False, "autoswapSettings": {}, "fs": {"files": {}, "current_size_bytes": 0, "max_size_bytes": 0, "source_dir": "", "mode": "memory", "initialized": False}, "restart_override_base_config": "", "current_model_override": "", "OpenLumara": False}
 using_gui_launcher = False
 fs_lock = threading.Lock()
 # Used only by in-memory filesystem mode to represent empty directories.
@@ -269,6 +271,7 @@ deprecated_keys = {
     "pipelineparallel",
     "nopipelineparallel",
     "sdnotile",
+    "sdt5xxl",
     "forceversion",
     "sdgendefaults",
     "flashattention",
@@ -1601,6 +1604,17 @@ def get_current_admindir_list():
     return opts
 
 
+def get_initial_admin_model(config_path, admin_dir):
+    if not config_path or not admin_dir or not os.path.isdir(admin_dir):
+        return "initial_model"
+    dirpath = os.path.abspath(admin_dir)
+    config_path = os.path.normcase(os.path.abspath(config_path))
+    for name in scan_directory(dirpath, (".kcpps", ".kcppt"), 1):
+        if os.path.normcase(os.path.abspath(os.path.join(dirpath, name))) == config_path:
+            return name
+    return "initial_model"
+
+
 def dump_gguf_metadata(file_path): #if you're gonna copy this into your own project at least credit concedo
     chunk_size = 1024*1024*20  # read first 20mb of file
     try:
@@ -2678,7 +2692,7 @@ def sd_get_device_override(deviceid, module=''):
         result = device_name
     return result
 
-def sd_load_model(model_filename,vae_filename,t5xxl_filename,clip1_filename,clip2_filename,photomaker_filename,upscaler_filename,audio_vae_filename):
+def sd_load_model(model_filename,vae_filename,llm_filename,clip1_filename,clip2_filename,photomaker_filename,upscaler_filename,audio_vae_filename):
     global args, cached_sd_info
     inputs = sd_load_model_inputs()
     inputs = set_backend_props(inputs)
@@ -2709,7 +2723,7 @@ def sd_load_model(model_filename,vae_filename,t5xxl_filename,clip1_filename,clip
     inputs.tiled_vae_threshold = args.sdtiledvae
     inputs.vae_filename = vae_filename.encode("UTF-8")
     inputs.audio_vae_filename = audio_vae_filename.encode("UTF-8")
-    inputs.t5xxl_filename = t5xxl_filename.encode("UTF-8")
+    inputs.t5xxl_filename = llm_filename.encode("UTF-8")
     inputs.clip1_filename = clip1_filename.encode("UTF-8")
     inputs.clip2_filename = clip2_filename.encode("UTF-8")
     inputs.photomaker_filename = photomaker_filename.encode("UTF-8")
@@ -7769,52 +7783,57 @@ class KcppProxyHandler(http.server.BaseHTTPRequestHandler):
                     musicReqs = ["/api/extra/music/prepare","/api/extra/music/generate"]
                     imageReqs = ["/images/generations", "/v1/images/generations", "/images/edits", "/v1/images/edits", "/sdapi/v1/txt2img", "/sdapi/v1/img2img", "/sdapi/v1/upscale"] # "/sdapi/v1/sd-models", "/sdapi/v1/options", "/sdapi/v1/samplers"
 
-                    swapModeChanged = False
+                requestedType = None
 
-                    autoswapSettings = global_memory["autoswapSettings"]
-                    skipTextUnload = autoswapSettings.get("skipTextUnload", False)
-                    skipTTSUnload = autoswapSettings.get("skipTTSUnload", False)
-                    skipSSTUnload = autoswapSettings.get("skipSSTUnload", False)
-                    skipEmbedUnload = autoswapSettings.get("skipEmbedUnload", False)
-                    skipMusicUnload = autoswapSettings.get("skipMusicUnload", False)
-                    skipImageUnload = autoswapSettings.get("skipImageUnload", False)
+                autoswapSettings = global_memory["autoswapSettings"]
+                skipTextUnload = autoswapSettings.get("skipTextUnload", False)
+                skipTTSUnload = autoswapSettings.get("skipTTSUnload", False)
+                skipSSTUnload = autoswapSettings.get("skipSSTUnload", False)
+                skipEmbedUnload = autoswapSettings.get("skipEmbedUnload", False)
+                skipMusicUnload = autoswapSettings.get("skipMusicUnload", False)
+                skipImageUnload = autoswapSettings.get("skipImageUnload", False)
 
-                    if not skipTextUnload and any(clean_path.endswith(e) for e in textReqs) and (global_memory["swapReqType"] is None or global_memory["swapReqType"] != "text"):
-                        global_memory["swapReqType"] = "text"
-                        swapModeChanged = True
-                    elif not skipSSTUnload and any(clean_path.endswith(e) for e in sttReqs) and (global_memory["swapReqType"] is None or global_memory["swapReqType"] != "stt"):
-                        global_memory["swapReqType"] = "stt"
-                        swapModeChanged = True
-                    elif not skipTTSUnload and any(clean_path.endswith(e) for e in ttsReqs) and (global_memory["swapReqType"] is None or global_memory["swapReqType"] != "tts"):
-                        global_memory["swapReqType"] = "tts"
-                        swapModeChanged = True
-                    elif not skipEmbedUnload and any(clean_path.endswith(e) for e in embedReqs) and (global_memory["swapReqType"] is None or global_memory["swapReqType"] != "embed"):
-                        global_memory["swapReqType"] = "embed"
-                        swapModeChanged = True
-                    elif not skipMusicUnload and any(clean_path.endswith(e) for e in musicReqs) and (global_memory["swapReqType"] is None or global_memory["swapReqType"] != "music"):
-                        global_memory["swapReqType"] = "music"
-                        swapModeChanged = True
-                    elif not skipImageUnload and any(clean_path.endswith(e) for e in imageReqs) and (global_memory["swapReqType"] is None or global_memory["swapReqType"] != "image"):
-                        global_memory["swapReqType"] = "image"
-                        swapModeChanged = True
+                if not skipTextUnload and any(clean_path.endswith(e) for e in textReqs):
+                    requestedType = "text"
+                elif not skipSSTUnload and any(clean_path.endswith(e) for e in sttReqs):
+                    requestedType = "stt"
+                elif not skipTTSUnload and any(clean_path.endswith(e) for e in ttsReqs):
+                    requestedType = "tts"
+                elif not skipEmbedUnload and any(clean_path.endswith(e) for e in embedReqs):
+                    requestedType = "embed"
+                elif not skipMusicUnload and any(clean_path.endswith(e) for e in musicReqs):
+                    requestedType = "music"
+                elif not skipImageUnload and any(clean_path.endswith(e) for e in imageReqs):
+                    requestedType = "image"
 
-                    if (global_memory["swapReqType"] is not None and swapModeChanged):
-                        reqbody = json.dumps({"filename":global_memory["current_model"], "baseconfig": global_memory["base_config"], "modelName": global_memory["current_model_override"]})
-                        reqheaders = {
-                            'Content-Type': 'application/json',
-                            'Content-Length': str(len(reqbody)),
-                        }
-                        if args.adminpassword:
-                            reqheaders["Authorization"] = f"Bearer {args.adminpassword}"
-                        conn = http.client.HTTPConnection('localhost', upstream_port, timeout=args.reqtimeout)
-                        conn.request("POST", "/api/admin/reload_config", body=reqbody, headers=reqheaders)
-                        resp = conn.getresponse()
-                        time.sleep(3)
-                        global_memory["last_active_timestamp"] = datetime.now()
-                        if not self.wait_for_upstream_ready(upstream_port,120,0.5):
-                            self.send_error(504, "KoboldCpp model swap reload timed out")
-                            return
-                        time.sleep(0.1)
+                # A worker may contain several below-threshold model families. Only
+                # restart when the requested family is neither resident nor the
+                # family most recently requested for this configuration.
+                loadedReqTypes = list(global_memory.get("loadedReqTypes", []))
+                swapModeChanged = (requestedType is not None
+                    and requestedType not in loadedReqTypes
+                    and requestedType != global_memory["swapReqType"])
+                if swapModeChanged:
+                    global_memory["swapReqType"] = requestedType
+
+                if (global_memory["swapReqType"] is not None and swapModeChanged):
+                    global_memory["triggered_sleeping"] = False
+                    reqbody = json.dumps({"filename":global_memory["current_model"], "baseconfig": global_memory["base_config"], "modelName": global_memory["current_model_override"]})
+                    reqheaders = {
+                        'Content-Type': 'application/json',
+                        'Content-Length': str(len(reqbody)),
+                    }
+                    if args.adminpassword:
+                        reqheaders["Authorization"] = f"Bearer {args.adminpassword}"
+                    conn = http.client.HTTPConnection('localhost', upstream_port, timeout=args.reqtimeout)
+                    conn.request("POST", "/api/admin/reload_config", body=reqbody, headers=reqheaders)
+                    resp = conn.getresponse()
+                    time.sleep(3)
+                    global_memory["last_active_timestamp"] = datetime.now()
+                    if not self.wait_for_upstream_ready(upstream_port,120,0.5):
+                        self.send_error(504, "KoboldCpp model swap reload timed out")
+                        return
+                    time.sleep(0.1)
 
         try:  # connect upstream
             conn = http.client.HTTPConnection(target_host, target_port, timeout=args.reqtimeout)
@@ -8242,6 +8261,9 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
         self.port = port
 
     def __call__(self, *args, **kwargs):
+        # Each server worker reuses this handler across connections. A failed
+        # header write leaves the previous response's buffer uncleared.
+        self._headers_buffer = []
         super().__init__(*args, **kwargs)
 
     def log_message(self, format, *args):
@@ -8600,12 +8622,10 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
         if api_format in (3, 4):
             genparams['_oai_generation_pending'] = True
         try:
-            if stream_flag:
-                loop = asyncio.get_event_loop()
-                executor = ThreadPoolExecutor()
-                genout = await loop.run_in_executor(executor, run_blocking)
-            else:
-                genout = run_blocking()
+            # Leave the event loop free to monitor non-streaming requests too.
+            # asyncio.run waits for this executor before the request handler returns.
+            loop = asyncio.get_running_loop()
+            genout = await loop.run_in_executor(None, run_blocking)
         finally:
             genparams.pop('_oai_generation_pending', None)
 
@@ -9472,10 +9492,14 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
 
     async def monitor_connection(self, cancel_fn): #Poll the socket to detect client disconnection
         import select
+        import ssl
+        sock = self.connection
+        # SSLSocket.recv rejects MSG_PEEK. Readability alone is not a disconnect.
+        if isinstance(sock, ssl.SSLSocket):
+            return
         loop = asyncio.get_event_loop()
         def check_connection_closed():
             try:
-                sock = self.connection
                 readable, _, exceptional = select.select([sock], [], [sock], 0)
                 if exceptional:
                     return True
@@ -9485,8 +9509,10 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                     if len(data) == 0:
                         return True
                 return False
-            except (OSError, Exception):
-                return True  # Treat any error as disconnected
+            except (BlockingIOError, InterruptedError):
+                return False
+            except OSError:
+                return True
         while True:
             try:
                 await asyncio.sleep(0.5)
@@ -9502,10 +9528,30 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
     async def handle_request(self, genparams, api_format, stream_flag):
         tasks = []
         genparams["oai_uniqueid"] = random.randint(100000, 999999)
-        for key in ('_sse_stream_started', '_sse_stream_finished', '_oai_generation_pending', '_oai_generation_error', '_anthropic_stream_state'):
+        for key in ('_sse_stream_started', '_sse_stream_finished', '_oai_generation_pending', '_oai_generation_error', '_anthropic_stream_state', '_client_disconnected', '_json_keepalive_started'):
             genparams.pop(key, None)
         monitor_task = None
         tool_keepalive_task = None
+        json_keepalive_task = None
+        batch_expected = genparams.get('_batch_expected', False)
+
+        def disconnected():
+            genparams['_client_disconnected'] = True
+            self.close_connection = True
+
+        async def monitor_generation():
+            await self.monitor_connection(disconnected)
+            # Keep waiting for the generator to finish. An early abort can be
+            # reset during native startup, or precede publication of a batch ID.
+            while genparams.get('_client_disconnected', False) and not generate_task.done():
+                batch_request_id = genparams.get('_batch_request_id', -1)
+                if batch_request_id >= 0:
+                    handle.batch_generate_abort(batch_request_id)
+                elif not batch_expected:
+                    handle.abort_generate()
+                # Never use a global abort for an expected batch without an ID:
+                # it may be starting or already released by the worker thread.
+                await asyncio.sleep(0.1)
 
         async def run_generation():
             try:
@@ -9523,10 +9569,22 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                 tasks.append(self.handle_sse_stream(genparams, api_format))
             generate_task = asyncio.create_task(run_generation())
             tasks.append(generate_task)
-            if stream_flag:
-                monitor_task = asyncio.create_task(self.monitor_connection(handle.abort_generate))
-                if api_format in (4, 7, 9) and genparams.get('using_openai_tools', False):
-                    tool_keepalive_task = asyncio.create_task(self.send_tool_stream_keepalives(genparams, api_format))
+            monitor_task = asyncio.create_task(monitor_generation())
+            if stream_flag and api_format in (4, 7, 9) and genparams.get('using_openai_tools', False):
+                tool_keepalive_task = asyncio.create_task(self.send_tool_stream_keepalives(genparams, api_format))
+            elif not stream_flag and self.headers.get('X-KoboldCpp-Keepalive', '').lower() == 'true':
+                def start_keepalive():
+                    # Commit headers only if the request outlasts the first
+                    # interval. Fast errors can still return their HTTP status.
+                    self.close_connection = True
+                    self.send_response(200)
+                    self.send_header('connection', 'close')
+                    self.send_header('X-Accel-Buffering', 'no')
+                    self.end_headers(content_type='application/json')
+                    genparams['_json_keepalive_started'] = True
+
+                json_keepalive_task = asyncio.create_task(
+                    self.send_json_keepalives(disconnected, interval=15, start_fn=start_keepalive))
             await asyncio.gather(*tasks)
             generate_result = generate_task.result()
             return generate_result
@@ -9554,13 +9612,23 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                     await tool_keepalive_task
                 except (asyncio.CancelledError, OSError):
                     pass
+            if json_keepalive_task:
+                if not json_keepalive_task.done():
+                    json_keepalive_task.cancel()
+                try:
+                    await json_keepalive_task
+                except (asyncio.CancelledError, OSError):
+                    pass
 
-    async def send_json_keepalives(self, cancel_fn, interval=50):
+    async def send_json_keepalives(self, cancel_fn, interval=50, start_fn=None):
         # Leading whitespace is valid JSON. Padding also helps small proxy buffers
         # make progress; it cannot bypass a proxy's absolute request time limit.
         try:
             while True:
                 await asyncio.sleep(interval)
+                if start_fn:
+                    start_fn()
+                    start_fn = None
                 self.wfile.write(b' ' * 2047 + b'\n')
                 self.wfile.flush()
         except OSError:
@@ -11847,6 +11915,8 @@ Change Mode<br>
                             batched_request_runner_count += 1
 
                     gendat = asyncio.run(self.handle_request(genparams, api_format, sse_stream_flag))
+                    if genparams.pop('_client_disconnected', False):
+                        return
 
                     try:
                         modelNameToReturn = friendlymodelname
@@ -11859,17 +11929,21 @@ Change Mode<br>
                                 self.wfile.flush()
                                 self.close_connection = True
                             else:
-                                self.send_response(500)
-                                self.send_header('content-length', str(len(genresp)))
-                                self.end_headers(content_type='application/json')
+                                # Once keepalives start, errors use the same JSON
+                                # body and the already committed HTTP 200 status.
+                                if not genparams.get('_json_keepalive_started', False):
+                                    self.send_response(500)
+                                    self.send_header('content-length', str(len(genresp)))
+                                    self.end_headers(content_type='application/json')
                                 self.wfile.write(genresp)
                             return
                         # Headers are already sent when streaming
                         if not sse_stream_flag:
-                            self.send_response(200)
                             genresp = (json.dumps(gendat).encode())
-                            self.send_header('content-length', str(len(genresp)))
-                            self.end_headers(content_type='application/json')
+                            if not genparams.get('_json_keepalive_started', False):
+                                self.send_response(200)
+                                self.send_header('content-length', str(len(genresp)))
+                                self.end_headers(content_type='application/json')
                             self.wfile.write(genresp)
                         elif (api_format == 4 or api_format == 7 or api_format == 9) and genparams.get('using_openai_tools', False): #special case, fake streaming for tool calls
                             if genparams.get('tc_true_streamed', False):
@@ -12387,7 +12461,7 @@ Change Mode<br>
             self.send_header('content-type', content_type)
         return super(KcppServerRequestHandler, self).end_headers()
 
-def RunServerMultiThreaded(addr, port, server_handler):
+def RunServerMultiThreaded(addr, port, server_handler, on_ready=None):
     global exitcounter, sslvalid, global_memory, num_server_threads
     if is_port_in_use(port):
         print(f"Warning: Port {port} already appears to be in use by another program.")
@@ -12465,6 +12539,8 @@ def RunServerMultiThreaded(addr, port, server_handler):
     threadArr = []
     for i in range(num_server_threads):
         threadArr.append(Thread(i))
+    if on_ready:
+        on_ready()
     while 1:
         try:
             time.sleep(10)
@@ -12617,7 +12693,7 @@ def save_config_dict(filename, savdict, template):
         filenamestr += ".kcpps"
     if not filenamestr.endswith(".kcppt") and template:
         filenamestr += ".kcppt"
-    do_not_save = {'allow_config_onready', 'analyze', 'config', 'exportconfig', 'exporttemplate', 'testmemory', 'unpack', 'version'}
+    do_not_save = {'agent_api_key', 'agent_base_url', 'allow_config_onready', 'analyze', 'config', 'exportconfig', 'exporttemplate', 'run_bundled_agent', 'testmemory', 'unpack', 'version'}
     filtered = {k: v for k, v in savdict.items() if k not in do_not_save}
     if 'gendefaults' in filtered:
         gendefaults = parse_json_object(filtered['gendefaults'], 'gendefaults')
@@ -12870,6 +12946,7 @@ def show_gui():
     batchsize_text = ["Don't Batch","16","32","64","128","256","512","1024","2048","4096"]
     ubatchsize_text = ["Match Batch Size","16","32","64","128","256","512","1024","2048","4096"]
     contextsize_text = ["256", "512", "1024", "2048", "3072", "4096", "5120", "6144", "7168", "8192", "9216", "10240", "11264", "12288", "13312", "14336", "15360", "16384", "18432", "20480", "22528", "24576", "26624", "28672", "30720", "32768", "36864", "40960", "45056", "49152", "53248", "57344", "61440", "65536", "73728", "81920", "90112", "98304", "106496", "114688", "122880", "131072", "147456", "163840", "180224", "196608", "212992", "229376", "245760", "262144" ]
+    default_contextsize_index = contextsize_text.index(str(default_maxctx))
     quantkv_text = ["f16","bf16","q8_0","q5_1","q4_0"]
 
     if not any(runopts):
@@ -12987,7 +13064,7 @@ def show_gui():
     sd_loramult_var = ctk.StringVar(value="1.0")
     sd_vae_var = ctk.StringVar()
     sd_audio_vae_var = ctk.StringVar()
-    sd_t5xxl_var = ctk.StringVar()
+    sd_llm_var = ctk.StringVar()
     sd_clip1_var = ctk.StringVar()
     sd_clip2_var = ctk.StringVar()
     sd_photomaker_var = ctk.StringVar()
@@ -13029,6 +13106,7 @@ def show_gui():
     embeddings_gpu_var = ctk.IntVar(value=0)
 
     admin_var = ctk.IntVar(value=0)
+    agent_var = ctk.IntVar(value=1 if args.agent else 0)
     admin_dir_var = ctk.StringVar()
     baseconfig_var = ctk.StringVar()
     admin_text_model_dir_var = ctk.StringVar()
@@ -13038,6 +13116,7 @@ def show_gui():
     singleinstance_var = ctk.IntVar(value=0)
     router_mode_var = ctk.IntVar(value=0)
     autoswap_mode_var = ctk.IntVar(value=0)
+    autoswap_threshold_var = ctk.StringVar(value=str(default_autoswap_threshold))
     autoswap_skiptextunload_var = ctk.IntVar(value=0)
     autoswap_skipsstunload_var = ctk.IntVar(value=0)
     autoswap_skipttsunload_var = ctk.IntVar(value=0)
@@ -13646,7 +13725,7 @@ def show_gui():
         makecheckbox(quick_tab, name, properties[0], int(idx/2) + 20, idx % 2, tooltiptxt=properties[1])
 
     # context size
-    makeslider(quick_tab, "Context Size:", contextsize_text, context_var, 40, width=280, set=13, tooltip="What is the maximum context size to support. Model specific. You cannot exceed it.\nLarger contexts require more memory, and not all models support it.")
+    makeslider(quick_tab, "Context Size:", contextsize_text, context_var, 40, width=280, set=default_contextsize_index, tooltip="What is the maximum context size to support. Model specific. You cannot exceed it.\nLarger contexts require more memory, and not all models support it.")
 
     # load model
     makefileentry(quick_tab, "GGUF Text Model:", "Select GGUF or GGML Model File", model_var, 50, 280, onchoosefile=on_picked_model_file,tooltiptxt="Select a GGUF or GGML model file on disk to be loaded.")
@@ -13738,7 +13817,7 @@ def show_gui():
     cacheslots_entry, cacheslots_label = makelabelentry(context_tab, "CacheSlots:", smartcacheslots_var, row=5, padx=(300), singleline=True, tooltip="Number of slots for smartcache",labelpadx=(220))
 
     # context size
-    makeslider(context_tab, "Context Size:",contextsize_text, context_var, 18, width=280, set=13,tooltip="What is the maximum context size to support. Model specific. You cannot exceed it.\nLarger contexts require more memory, and not all models support it.")
+    makeslider(context_tab, "Context Size:",contextsize_text, context_var, 18, width=280, set=default_contextsize_index,tooltip="What is the maximum context size to support. Model specific. You cannot exceed it.\nLarger contexts require more memory, and not all models support it.")
     context_var.trace_add("write", changed_gpulayers_estimate)
     makelabelentry(context_tab, "Default Gen Amt:", defaultgenamt_var, row=20, padx=(120), singleline=True, tooltip="How many tokens to generate by default, if not specified. Must be smaller than context size. Usually, your frontend GUI will override this.")
     makelabelentry(context_tab, "Prompt Limit:", genlimit_var, row=20, padx=(300), singleline=True, tooltip="If set, restricts max output tokens to this limit regardless of API request. Set to 0 to disable.",labelpadx=(210))
@@ -14054,7 +14133,7 @@ def show_gui():
     imglora4,imglora5 = makelabelentry(images_tab, "Multiplier:" , sd_loramult_var, 20, 50,padx=(390),singleline=True,tooltip="What mutiplier value to apply the SD LoRA with.",labelpadx=(330))
     imglora6,imglora7,imglora8 = makefileentry(images_tab, "LoRA Dir:", "Select directory for runtime lora triggers",sd_lora_var, 20, width=280, singlerow=True, dialog_type=2,tooltiptxt="Select directory containing LoRAs that can be used at runtime.\nSyntax is <lora:name:weight>")
 
-    makefileentry(images_tab, "T5-XXL File:", "Select T5-XXL model file (SD3, Flux, WAN)",sd_t5xxl_var, 24, width=280, singlerow=True, filetypes=[("*.safetensors *.gguf","*.safetensors *.gguf")],tooltiptxt="Select a .safetensors t5xxl file to be loaded.")
+    makefileentry(images_tab, "Image LLM:", "Select image text encoder or LLM model file",sd_llm_var, 24, width=280, singlerow=True, filetypes=[("*.safetensors *.gguf","*.safetensors *.gguf")],tooltiptxt="Select a .safetensors or .gguf text encoder or LLM file for image generation.")
     makefileentry(images_tab, "Clip-1 File:", "Select First Clip model file (Clip-L for SD3 or Flux, or other vision encoder)",sd_clip1_var, 26, width=280, singlerow=True, filetypes=[("*.safetensors *.gguf","*.safetensors *.gguf")],tooltiptxt="Select a .safetensors Clip-1 file to be loaded.\nThis is Clip-L for SD3 and Flux, Clip Vision for WAN, and Qwen2.5VL for QwenImage")
     makefileentry(images_tab, "Clip-2 File:", "Select Second Clip model file (Clip-G for SD3)",sd_clip2_var, 28, width=280, singlerow=True, filetypes=[("*.safetensors *.gguf","*.safetensors *.gguf")],tooltiptxt="Select a .safetensors Clip-2 file to be loaded.\nThis is Clip-G for SD3")
     makefileentry(images_tab, "PhotoMaker:", "Select Optional PhotoMaker model file (SDXL)",sd_photomaker_var, 30, width=280, singlerow=True, filetypes=[("*.safetensors *.gguf","*.safetensors *.gguf")],tooltiptxt="PhotoMaker is a model that allows face cloning.\nSelect a .safetensors PhotoMaker file to be loaded (SDXL only).")
@@ -14123,6 +14202,15 @@ def show_gui():
             autoswap_mode_box.grid()
         else:
             autoswap_mode_box.grid_remove()
+        toggleautoswap(1,1,1)
+
+    def toggleautoswap(a,b,c):
+        if autoswap_mode_var.get()==1 and router_mode_var.get()==1 and admin_var.get()==1:
+            autoswap_threshold_entry.grid()
+            autoswap_threshold_label.grid()
+        else:
+            autoswap_threshold_entry.grid_remove()
+            autoswap_threshold_label.grid_remove()
 
     makecheckbox(admin_tab, "Enable Model Administration", admin_var, 1, 0, command=toggleadmin,tooltiptxt="Enable a admin server, allowing you to remotely relaunch and swap models and configs.")
     makelabelentry(admin_tab, "Admin Password:" , admin_password_var, 3, 150,padx=(120),singleline=True,tooltip="Require a password to access admin functions. You are strongly advised to use one for publically accessible instances!")
@@ -14134,9 +14222,11 @@ def show_gui():
     makefileentry(admin_tab, "Documents Directory:", "Select directory containing text or PDF documents for semantic search", admin_docs_dir_var, 15, width=280, dialog_type=2, tooltiptxt="Specify a directory containing text or PDF files. Accessible read-only at /INTERNAL_READ_ONLY/Documents via filesystem API endpoints.")
     makecheckbox(admin_tab, "Allow Model Download From HuggingFace", admin_allow_hf_var, 17, 0,tooltiptxt="Allows model downloading from HuggingFace within the Lite UI.")
     makecheckbox(admin_tab, "SingleInstance Mode", singleinstance_var, 19, 0,tooltiptxt="Allows this server to be shut down by another KoboldCpp instance with singleinstance starting on the same port.")
-    makecheckbox(admin_tab, "Developer Mode", developer_mode_var, 21, 0,tooltiptxt="Enables developer utilities such as hot reloading of Kobold Lite from disk.")
+    makecheckbox(admin_tab, "Developer Mode", developer_mode_var, 21, 0, tooltiptxt="Enables developer utilities such as hot reloading of Kobold Lite from disk.")
+    makecheckbox(admin_tab, "Launch KoboldCpp Agent", agent_var, 21, 0, padx=(160), tooltiptxt="Open the local tool-using agent in a new terminal after the KoboldCpp API is ready.")
     router_mode_box = makecheckbox(admin_tab, "Router Mode", router_mode_var, 23, 0, command=togglerouter, tooltiptxt="Router mode uses a reverse proxy router, allowing you to easily hotswap models and configs within a single request. Requires admin mode.")
     autoswap_mode_box = makecheckbox(admin_tab, "Autoswap Mode", autoswap_mode_var, 23, 0,padx=(160),tooltiptxt="Autoswap mode builds on router mode to allow switching of model types within the same config automatically. Requires admin mode and router mode. All models desired must be defined within the same config.")
+    autoswap_threshold_entry, autoswap_threshold_label = makelabelentry(admin_tab, "Autoswap Threshold (MB):", autoswap_threshold_var, 25, 70, padx=(180), singleline=True, tooltip="Model families at or below this combined file size remain loaded as sidecars. Only one model family above the threshold is loaded at a time.")
 
     autoswap_tab = tabcontent["Autoswap"]
     makelabel(autoswap_tab, "Autoswap Skip-Unload Options", 1, 0, "These options prevent specific model types from being unloaded during an autoswap. Useful when you want to keep certain models resident in memory across swaps. Requires Autoswap Mode to be enabled.")
@@ -14477,7 +14567,7 @@ def show_gui():
                 args.sdvae = sd_vae_var.get()
         args.sdaudiovae = sd_audio_vae_var.get() if sd_audio_vae_var.get() != "" else ""
         args.sdconvdirect = sd_convdirect_option(sd_convdirect_var.get())
-        args.sdt5xxl = sd_t5xxl_var.get() if sd_t5xxl_var.get() != "" else ""
+        args.sdllm = sd_llm_var.get() if sd_llm_var.get() != "" else ""
         args.sdclip1 = sd_clip1_var.get() if sd_clip1_var.get() != "" else ""
         args.sdclip2 = sd_clip2_var.get() if sd_clip2_var.get() != "" else ""
         args.sdphotomaker = sd_photomaker_var.get() if sd_photomaker_var.get() != "" else ""
@@ -14513,6 +14603,7 @@ def show_gui():
         args.musiclowvram = musiclowvram_var.get()==1
 
         args.admin = (admin_var.get()==1 and not args.cli)
+        args.agent = agent_var.get()==1
         args.admindir = admin_dir_var.get()
         args.admintextmodelsdir = admin_text_model_dir_var.get()
         args.admindatadir = admin_data_dir_var.get()
@@ -14521,6 +14612,7 @@ def show_gui():
         args.singleinstance = (singleinstance_var.get()==1)
         args.routermode = (router_mode_var.get()==1 and admin_var.get()==1)
         args.autoswapmode = (autoswap_mode_var.get()==1 and router_mode_var.get()==1 and admin_var.get()==1)
+        args.autoswapthreshold = (default_autoswap_threshold if autoswap_threshold_var.get()=="" else max(0, int(autoswap_threshold_var.get())))
         args.autoswapmode_skiptextunload = (autoswap_skiptextunload_var.get()==1)
         args.autoswapmode_skipsstunload = (autoswap_skipsstunload_var.get()==1)
         args.autoswapmode_skipttsunload = (autoswap_skipttsunload_var.get()==1)
@@ -14802,7 +14894,7 @@ def show_gui():
         sd_convdirect_var.set(sd_convdirect_option(mydict.get("sdconvdirect")))
         sd_vae_var.set(mydict["sdvae"] if ("sdvae" in mydict and mydict["sdvae"]) else "")
         sd_audio_vae_var.set(mydict["sdaudiovae"] if ("sdaudiovae" in mydict and mydict["sdaudiovae"]) else "")
-        sd_t5xxl_var.set(mydict["sdt5xxl"] if ("sdt5xxl" in mydict and mydict["sdt5xxl"]) else "")
+        sd_llm_var.set(mydict["sdllm"] if ("sdllm" in mydict and mydict["sdllm"]) else "")
         sd_clip1_var.set(mydict["sdclip1"] if ("sdclip1" in mydict and mydict["sdclip1"]) else "")
         sd_clip2_var.set(mydict["sdclip2"] if ("sdclip2" in mydict and mydict["sdclip2"]) else "")
         sd_photomaker_var.set(mydict["sdphotomaker"] if ("sdphotomaker" in mydict and mydict["sdphotomaker"]) else "")
@@ -14849,8 +14941,10 @@ def show_gui():
         embeddings_gpu_var.set(mydict["embeddingsgpu"] if ("embeddingsgpu" in mydict) else 0)
 
         admin_var.set(mydict["admin"] if ("admin" in mydict) else 0)
+        agent_var.set(mydict["agent"] if ("agent" in mydict) else 0)
         router_mode_var.set(mydict["routermode"] if ("routermode" in mydict) else 0)
         autoswap_mode_var.set(mydict["autoswapmode"] if ("autoswapmode" in mydict) else 0)
+        autoswap_threshold_var.set(mydict["autoswapthreshold"] if ("autoswapthreshold" in mydict) else default_autoswap_threshold)
         autoswap_skiptextunload_var.set(1 if "autoswapmode_skiptextunload" in mydict and mydict["autoswapmode_skiptextunload"] else 0)
         autoswap_skipsstunload_var.set(1 if "autoswapmode_skipsstunload" in mydict and mydict["autoswapmode_skipsstunload"] else 0)
         autoswap_skipttsunload_var.set(1 if "autoswapmode_skipttsunload" in mydict and mydict["autoswapmode_skipttsunload"] else 0)
@@ -14987,7 +15081,7 @@ def show_gui():
         ctk.CTkButton(popup, text="Load Template", command=load_easy_template).pack(pady=5)
         newbdesc1 = ctk.CTkLabel(popup, text="LowSpec = Recommend 6GB VRAM\nMidSpec = Recommend 12GB VRAM\nHighSpec = Recommend 24GB VRAM")
         newbdesc1.pack(pady=(10, 0))
-        newbdesc2 = ctk.CTkLabel(popup, text="Everything = All Features         Text = Text Generation\nImages = Image Generation         Vision = Image Recognition\nVoice = Speech Generation         Audio = Speech Recognition")
+        newbdesc2 = ctk.CTkLabel(popup, text="Quickly get started with basic templates.\nSelect your desired use case.")
         newbdesc2.pack(pady=(10, 0))
         commdesc = ctk.CTkLabel(popup, text="Templates here are subject to change from time to time.\n\nFound a broken template? Want to contribute one?\nVisit https://huggingface.co/koboldcpp/popular-templates/")
         commdesc.pack_forget()
@@ -15077,7 +15171,7 @@ def show_gui_yesnobox(title,message,icon='error'):
 def print_with_time(txt):
     print(f"{datetime.now().strftime('[%H:%M:%S]')} " + txt, flush=True)
 
-def make_url_request(url, data, method='POST', headers={}, timeout=300):
+def make_url_request(url, data, method='POST', headers={}, timeout=600):
     global nocertify
     try:
         request = None
@@ -15329,6 +15423,8 @@ def convert_invalid_args(args):
         dict["port"] = dict["port_param"]
     if "sdnotile" in dict and "sdtiledvae" not in dict:
         dict["sdtiledvae"] = (0 if (dict["sdnotile"]) else default_vae_tile_threshold) # convert legacy option
+    if "sdt5xxl" in dict and dict["sdt5xxl"] and not dict.get("sdllm"):
+        dict["sdllm"] = dict["sdt5xxl"] # convert legacy option
     if 'sdquant' in dict and type(dict['sdquant']) is bool:
         dict['sdquant'] = 2 if dict['sdquant'] else 0
     if "sdclipl" in dict and "sdclip1" not in dict:
@@ -15526,6 +15622,30 @@ def load_config_cli(filename):
             if (args.usecuda is None) and (args.usevulkan is None):
                 print("Automatically selecting your backend...")
                 auto_set_backend_cli()
+
+def apply_agent_launch_safeguards(launch_args):
+    if not launch_args.agent:
+        return
+
+    adjustments = []
+    if launch_args.defaultgenamt < 8192:
+        adjustments.append(f"default generation amount increased from {launch_args.defaultgenamt} to 8192")
+        launch_args.defaultgenamt = 8192
+    if launch_args.contextsize < 28672:
+        adjustments.append(f"context size increased from {launch_args.contextsize} to 28672")
+        launch_args.contextsize = 28672
+    if not launch_args.jinja:
+        adjustments.append("Jinja chat templates enabled")
+        launch_args.jinja = True
+    if not launch_args.jinja_tools:
+        adjustments.append("Jinja tool formatting enabled")
+        launch_args.jinja_tools = True
+
+    if adjustments:
+        print("\nWARNING: KoboldCpp Agent adjusted launch settings for reliable tool use:")
+        for adjustment in adjustments:
+            print(f"  - {adjustment}")
+        print()
 
 def convert_args_to_template(savdict):
     savdict["istemplate"] = True
@@ -15769,6 +15889,119 @@ def analyze_gguf_model_wrapper(filename=""):
     print(f"Analyzing {filename}, please wait...\n---",flush=True)
     dumpthread = threading.Thread(target=analyze_gguf_model, args=(args,filename))
     dumpthread.start()
+
+
+def get_kobold_agent_path():
+    base_path = getattr(sys, '_MEIPASS', os.path.abspath(os.path.dirname(__file__)))
+    return os.path.join(base_path, "kcpp_agent.py")
+
+
+def run_bundled_kobold_agent(base_url=None, api_key=None):
+    """Run the bundled agent script inside a frozen KoboldCpp process."""
+    agent_path = get_kobold_agent_path()
+    if not os.path.isfile(agent_path):
+        raise FileNotFoundError(f"Kobold Agent script not found: {agent_path}")
+
+    import runpy
+    old_argv = sys.argv
+    try:
+        sys.argv = [agent_path]
+        if base_url:
+            sys.argv.extend(["--base-url", base_url])
+        if api_key:
+            sys.argv.extend(["--api-key", api_key])
+        runpy.run_path(agent_path, run_name="__main__")
+    finally:
+        sys.argv = old_argv
+
+
+def launch_kobold_agent_terminal(base_url=None, api_key=None):
+    """Open the agent in a new terminal, using the bundled runner when frozen."""
+    agent_path = get_kobold_agent_path()
+    if not os.path.isfile(agent_path):
+        print(f"Cannot launch Kobold Agent: script not found at {agent_path}")
+        return False
+
+    is_frozen = getattr(sys, 'frozen', False)
+    command = ([sys.executable, "--run-bundled-agent"] if is_frozen
+               else [sys.executable, agent_path])
+    if base_url:
+        command.extend(["--agent-base-url" if is_frozen else "--base-url", base_url])
+    if api_key:
+        command.extend(["--agent-api-key" if is_frozen else "--api-key", api_key])
+
+    try:
+        if os.name == 'nt':
+            # Prefer Windows Terminal's Unicode/font fallback support over a
+            # fresh classic console, which may have different fonts from CMD.
+            terminal_path = shutil.which("wt.exe")
+            # wt treats semicolons as command separators, even within arguments.
+            # Use the direct launcher for these paths/credentials to preserve them.
+            if terminal_path and not any(";" in value for value in [os.getcwd(), *command]):
+                try:
+                    terminal_process = subprocess.Popen(
+                        [terminal_path, "-w", "-1", "new-tab", "-d", os.getcwd(), *command],
+                        cwd=os.getcwd(), creationflags=subprocess.CREATE_NO_WINDOW)
+                    try:
+                        if terminal_process.wait(timeout=3) == 0:
+                            return True
+                    except subprocess.TimeoutExpired:
+                        # Some versions keep the launcher alive with the window.
+                        return True
+                except OSError:
+                    pass  # An unavailable/broken execution alias can still be on PATH.
+            subprocess.Popen(command, cwd=os.getcwd(), creationflags=subprocess.CREATE_NEW_CONSOLE)
+        elif sys.platform == 'darwin':
+            shell_command = f"cd {shlex.quote(os.getcwd())} && exec {shlex.join(command)}"
+            apple_script = f'tell application "Terminal" to do script {json.dumps(shell_command)}'
+            subprocess.Popen(["osascript", "-e", apple_script], start_new_session=True)
+        else:
+            terminal_commands = [
+                ("x-terminal-emulator", ["-e"]),
+                ("gnome-terminal", ["--"]),
+                ("konsole", ["-e"]),
+                ("mate-terminal", ["--"]),
+                ("xfce4-terminal", ["-x"]),
+                ("xterm", ["-e"]),
+            ]
+            attempted = set()
+            failures = []
+            for terminal, terminal_args in terminal_commands:
+                terminal_path = shutil.which(terminal)
+                if not terminal_path:
+                    continue
+                # Distributions often link x-terminal-emulator to xterm. Do not
+                # retry the same broken terminal under a second name.
+                resolved_path = os.path.realpath(terminal_path)
+                if resolved_path in attempted:
+                    continue
+                attempted.add(resolved_path)
+                # xterm's default bitmap font is often absent in minimal WSL
+                # installations; request a fontconfig-backed font instead.
+                launch_args = (["-fa", "monospace"] if os.path.basename(resolved_path) == "xterm" else []) + terminal_args
+                try:
+                    terminal_process = subprocess.Popen(
+                        [terminal_path, *launch_args, *command],
+                        cwd=os.getcwd(), start_new_session=True)
+                    try:
+                        exit_code = terminal_process.wait(timeout=1)
+                    except subprocess.TimeoutExpired:
+                        return True  # The terminal is still open.
+                    if exit_code == 0:
+                        return True  # Some terminals hand off to a background process.
+                    failures.append(f"{terminal} exited with code {exit_code}")
+                except OSError as exc:
+                    failures.append(f"{terminal}: {exc}")
+            if failures:
+                print(f"Cannot launch Kobold Agent: {'; '.join(failures)}.")
+            else:
+                print("Cannot launch Kobold Agent: no supported terminal emulator was found.")
+            print("Try running kcpp_agent.py in another terminal window.")
+            return False
+        return True
+    except Exception as e:
+        print(f"Cannot launch Kobold Agent: {e}")
+        return False
 
 
 def register_koboldcpp():
@@ -16109,6 +16342,14 @@ def main(launch_args, default_args):
     global args, showdebug, kcpp_instance, exitcounter, using_gui_launcher, sslvalid, global_memory
     args = launch_args #note: these are NOT shared with the child processes!
 
+    if args.run_bundled_agent:
+        run_bundled_kobold_agent(args.agent_base_url, args.agent_api_key)
+        return
+
+    if args.agent and len(sys.argv) == 2:
+        launch_kobold_agent_terminal()
+        return
+
     if (args.version) and len(sys.argv) <= 2:
         print(f"{KcppVersion}") # just print version and exit
         return
@@ -16157,6 +16398,7 @@ def main(launch_args, default_args):
         return
 
     cfgname = ""
+    initial_config_path = ""
     if args.config and len(args.config)==1: #handle initial config loading for launch
         cfgname = args.config[0] #store first so baseconfig wont overwrite it
     
@@ -16183,6 +16425,7 @@ def main(launch_args, default_args):
                 reload_new_config(cfgname,vars(safeArgs),True)
             else:
                 load_config_cli(cfgname)
+            initial_config_path = cfgname
         elif args.ignoremissing:
             print("Ignoring missing kcpp config file...")
         else:
@@ -16200,6 +16443,7 @@ def main(launch_args, default_args):
         dlfile = download_model_from_url(args.model_param,[".kcpps",".kcppt"]) # maybe download from url
         if dlfile:
             args.model_param = dlfile
+        initial_config_path = args.model_param
         load_config_cli(args.model_param)
 
     if args.exportconfig:
@@ -16225,6 +16469,8 @@ def main(launch_args, default_args):
                 print("Note: In order to use --skiplauncher, you need to specify a model with --model")
             time.sleep(3)
             sys.exit(2)
+
+    apply_agent_launch_safeguards(args)
 
     if args.ssl: #need to duplicate here for the tunnel
         if len(args.ssl)==2 and isinstance(args.ssl[0], str) and os.path.exists(args.ssl[0]) and isinstance(args.ssl[1], str) and os.path.exists(args.ssl[1]):
@@ -16291,7 +16537,8 @@ def main(launch_args, default_args):
             input()
     else:  # manager command queue for admin mode
         with multiprocessing.Manager() as mp_manager:
-            global_memory = mp_manager.dict({"tunnel_url": "", "restart_target": "", "input_to_exit":False, "load_complete":False, "restart_model": "", "currentConfig": None, "currentBaseConfig": None, "modelOverride": None, "currentModel": None, "last_active_timestamp":datetime.now(), "triggered_sleeping":False, "current_model":"initial_model", "base_config":"", "swapReqType": None, "autoswapmode": False, "autoswapSettings": {}, "fs": {"files": {}, "current_size_bytes": 0, "max_size_bytes": 0, "source_dir": "", "mode": "memory", "initialized": False}, "restart_override_base_config": "", "current_model_override": "", "OpenLumara": False})
+            initial_model = get_initial_admin_model(initial_config_path, args.admindir)
+            global_memory = mp_manager.dict({"tunnel_url": "", "restart_target": "", "input_to_exit":False, "load_complete":False, "restart_model": "", "currentConfig": None, "currentBaseConfig": None, "modelOverride": None, "currentModel": None, "last_active_timestamp":datetime.now(), "triggered_sleeping":False, "current_model":initial_model, "base_config":"", "swapReqType": None, "loadedReqTypes": [], "autoswapmode": False, "autoswapSettings": {}, "fs": {"files": {}, "current_size_bytes": 0, "max_size_bytes": 0, "source_dir": "", "mode": "memory", "initialized": False}, "restart_override_base_config": "", "current_model_override": "", "OpenLumara": False})
             global_memory["autoswapmode"] = args.autoswapmode
             global_memory["autoswapSettings"] = build_autoswap_settings(args)
 
@@ -16329,13 +16576,14 @@ def main(launch_args, default_args):
                                 kcpp_instance.terminate()
                                 kcpp_instance.join(timeout=10)  # Ensure process is stopped
                                 kcpp_instance = None
-                            kcpp_instance = multiprocessing.Process(target=kcpp_main_process,kwargs={"launch_args": args, "g_memory": global_memory, "gui_launcher": False})
-                            kcpp_instance.daemon = True
-                            kcpp_instance.start()
                             global_memory["restart_target"] = ""
                             global_memory["restart_override_base_config"] = ""
                             global_memory["restart_model"] = ""
                             global_memory["swapReqType"] = None
+                            global_memory["loadedReqTypes"] = []
+                            kcpp_instance = multiprocessing.Process(target=kcpp_main_process,kwargs={"launch_args": args, "g_memory": global_memory, "gui_launcher": False})
+                            kcpp_instance.daemon = True
+                            kcpp_instance.start()
                             time.sleep(3)
                         else:
                             break # kill the program
@@ -16355,6 +16603,8 @@ def main(launch_args, default_args):
                                     print(f"[Unload Timeout] Inactive for over {time_since_last_active}s, unloading models via autoswap...")
                                     global_memory["swapReqType"] = "nomodel"
                                     global_memory["triggered_sleeping"] = True
+                                    restart_target = global_memory["current_model"]
+                                    restart_override_base_config = global_memory["base_config"]
                             elif global_memory["current_model"]!="unload_model":
                                 print(f"[Unload Timeout] Inactive for over {time_since_last_active}s, unloading models...")
                                 restart_target = "unload_model"
@@ -16389,6 +16639,7 @@ def main(launch_args, default_args):
                             if (os.path.exists(maintarget_filepath) or restart_target=="unload_model" or restart_target=="initial_model") and (restart_override_base_config=="" or os.path.exists(basecfg_filepath)):
                                 print("Terminating old process...")
                                 global_memory["load_complete"] = False
+                                global_memory["loadedReqTypes"] = []
                                 kcpp_instance.terminate()
                                 kcpp_instance.join(timeout=10)  # Ensure process is stopped
                                 kcpp_instance = None
@@ -16538,6 +16789,55 @@ def mk_lora_info(imgloras, multipliers):
             preloaded_table.append(lora_entry)
     return preloaded_table, lora_path_map, lora_name_map
 
+autoswap_model_fields = {
+    "text": ["model", "model_param", "lora", "mmproj", "draftmodel"],
+    "stt": ["whispermodel"],
+    "tts": ["ttsmodel", "ttswavtokenizer"],
+    "embed": ["embeddingsmodel"],
+    "music": ["musicllm", "musicembeddings", "musicdiffusion", "musicvae"],
+    "image": ["sdmodel", "sdllm", "sdclip1", "sdclip2", "sdphotomaker", "sdupscaler", "sdvae", "sdaudiovae", "sdlora"],
+}
+
+autoswap_primary_fields = {
+    "text": ["model", "model_param"],
+    "stt": ["whispermodel"],
+    "tts": ["ttsmodel"],
+    "embed": ["embeddingsmodel"],
+    "music": ["musicllm", "musicdiffusion"],
+    "image": ["sdmodel"],
+}
+
+def getAutoswapModelTypes(args):
+    result = []
+    for model_type, fields in autoswap_primary_fields.items():
+        if any(getattr(args, field, None) for field in fields):
+            result.append(model_type)
+    return result
+
+def getAutoswapModelSize(args, model_type):
+    """Return the combined on-disk size for a model family, or None if unknown."""
+    paths = set()
+    for field in autoswap_model_fields[model_type]:
+        value = getattr(args, field, None)
+        values = value if isinstance(value, (list, tuple)) else [value]
+        for path in values:
+            if isinstance(path, str) and path:
+                fullpath = os.path.abspath(path)
+                if os.path.isfile(fullpath):
+                    paths.add(os.path.normcase(fullpath))
+                elif os.path.isdir(fullpath) and field not in autoswap_primary_fields[model_type]:
+                    for root, _, filenames in os.walk(fullpath):
+                        for filename in filenames:
+                            paths.add(os.path.normcase(os.path.join(root, filename)))
+                else:
+                    return None
+    if not paths:
+        return None
+    try:
+        return sum(os.path.getsize(path) for path in paths)
+    except OSError:
+        return None
+
 def build_autoswap_settings(args):
     return {
         "skipTextUnload": getattr(args, "autoswapmode_skiptextunload", False) is not None and getattr(args, "autoswapmode_skiptextunload", False),
@@ -16549,34 +16849,37 @@ def build_autoswap_settings(args):
     }
 
 
-def disableSwappedFieldsInConfig(args, swapReqType, autoswapSettings):
-    print(f"Swapping to type: {swapReqType}")
+def disableSwappedFieldsInConfig(args, swapReqType):
+    threshold_mb = max(0, getattr(args, "autoswapthreshold", default_autoswap_threshold))
+    threshold_bytes = threshold_mb * 1024 * 1024
+    configured_types = getAutoswapModelTypes(args)
+    keep_types = set()
 
-    skipTextUnload = autoswapSettings.get("skipTextUnload", False)
-    skipTTSUnload = autoswapSettings.get("skipTTSUnload", False)
-    skipSSTUnload = autoswapSettings.get("skipSSTUnload", False)
-    skipEmbedUnload = autoswapSettings.get("skipEmbedUnload", False)
-    skipMusicUnload = autoswapSettings.get("skipMusicUnload", False)
-    skipImageUnload = autoswapSettings.get("skipImageUnload", False)
+    if swapReqType != "nomodel":
+        if swapReqType in configured_types:
+            keep_types.add(swapReqType)
+        for model_type in configured_types:
+            model_size = getAutoswapModelSize(args, model_type)
+            if model_size is not None and model_size <= threshold_bytes:
+                keep_types.add(model_type)
 
-    if not skipTextUnload and swapReqType != "text":
-        for e in ["model", "model_param", "lora", "mmproj"]:
-            setattr(args, e, "")
-    if not skipSSTUnload and swapReqType != "stt":
-        for e in ["whispermodel"]:
-            setattr(args, e, "")
-    if not skipTTSUnload and swapReqType != "tts":
-        for e in ["ttsmodel", "ttswavtokenizer"]:
-            setattr(args, e, "")
-    if not skipEmbedUnload and swapReqType != "embed":
-        for e in ["embeddingsmodel"]:
-            setattr(args, e, "")
-    if not skipMusicUnload and swapReqType != "music":
-        for e in ["musicllm", "musicembeddings", "musicdiffusion", "musicvae"]:
-            setattr(args, e, "")
-    if not skipImageUnload and swapReqType != "image":
-        for e in ["sdmodel", "sdt5xxl", "sdclip1", "sdclip2", "sdphotomaker", "sdupscaler", "sdvae", "sdaudiovae", "sdlora"]:
-            setattr(args, e, "")
+    print(f"Swapping to type: {swapReqType}; resident types: {', '.join(sorted(keep_types)) or 'none'} (threshold {threshold_mb} MB)")
+    for model_type, fields in autoswap_model_fields.items():
+        if model_type not in keep_types:
+            if model_type == "text" and skipTextUnload:
+                continue
+            if model_type == "stt" and skipSSTUnload:
+                continue
+            if model_type == "tts" and skipTTSUnload:
+                continue
+            if model_type == "embed" and skipEmbedUnload:
+                continue
+            if model_type == "music" and skipMusicUnload:
+                continue
+            if model_type == "image" and skipImageUnload:
+                continue
+            for field in fields:
+                setattr(args, field, "")
 
 
 def kcpp_main_process(launch_args, g_memory=None, gui_launcher=False):
@@ -16752,10 +17055,10 @@ def kcpp_main_process(launch_args, g_memory=None, gui_launcher=False):
         dlfile = download_model_from_url(args.sdmodel,[".gguf",".safetensors"],min_file_size=500000)
         if dlfile:
             args.sdmodel = dlfile
-    if args.sdt5xxl and args.sdt5xxl!="":
-        dlfile = download_model_from_url(args.sdt5xxl,[".gguf",".safetensors"],min_file_size=500000)
+    if args.sdllm and args.sdllm!="":
+        dlfile = download_model_from_url(args.sdllm,[".gguf",".safetensors"],min_file_size=500000)
         if dlfile:
-            args.sdt5xxl = dlfile
+            args.sdllm = dlfile
     if args.sdclip1 and args.sdclip1!="":
         dlfile = download_model_from_url(args.sdclip1,[".gguf",".safetensors"],min_file_size=500000)
         if dlfile:
@@ -17128,7 +17431,7 @@ def kcpp_main_process(launch_args, g_memory=None, gui_launcher=False):
                 exit_with_error(2,f"Cannot find image model file: {imgmodel}")
         else:
             imgvae = ""
-            imgt5xxl = ""
+            imgllm = ""
             imgclip1 = ""
             imgclip2 = ""
             imgphotomaker = ""
@@ -17146,11 +17449,11 @@ def kcpp_main_process(launch_args, g_memory=None, gui_launcher=False):
                     imgaudiovae = os.path.abspath(args.sdaudiovae)
                 else:
                     print("Missing SD Audio VAE model file...")
-            if args.sdt5xxl:
-                if os.path.exists(args.sdt5xxl):
-                    imgt5xxl = os.path.abspath(args.sdt5xxl)
+            if args.sdllm:
+                if os.path.exists(args.sdllm):
+                    imgllm = os.path.abspath(args.sdllm)
                 else:
-                    print("Missing SD T5-XXL model file...")
+                    print("Missing image LLM model file...")
             if args.sdclip1:
                 if os.path.exists(args.sdclip1):
                     imgclip1 = os.path.abspath(args.sdclip1)
@@ -17177,7 +17480,7 @@ def kcpp_main_process(launch_args, g_memory=None, gui_launcher=False):
             friendlysdmodelname = os.path.basename(imgmodel)
             friendlysdmodelname = os.path.splitext(friendlysdmodelname)[0]
             friendlysdmodelname = sanitize_string(friendlysdmodelname)
-            loadok = sd_load_model(imgmodel,imgvae,imgt5xxl,imgclip1,imgclip2,imgphotomaker,imgupscaler,imgaudiovae)
+            loadok = sd_load_model(imgmodel,imgvae,imgllm,imgclip1,imgclip2,imgphotomaker,imgupscaler,imgaudiovae)
             print("Load Image Model OK: " + str(loadok))
             if not loadok:
                 exitcounter = 999
@@ -17440,6 +17743,8 @@ def kcpp_main_process(launch_args, g_memory=None, gui_launcher=False):
         endpoint_url = f"{httpsaffix}://{args.host}:{displayedport}"
 
     if start_server:
+        if global_memory is not None:
+            global_memory["loadedReqTypes"] = getAutoswapModelTypes(args) if autoswapmode else []
         if not args.remotetunnel:
             if displayedport!=11434:
                 print("Note: For third party Ollama API Emulation, you should set the port to 11434.")
@@ -17470,6 +17775,14 @@ def kcpp_main_process(launch_args, g_memory=None, gui_launcher=False):
                 LaunchWebbrowser(endpoint_url,"--launch was set, but could not launch web browser automatically.")
             browser_thread = threading.Timer(2, launch_browser_thread) #2 second delay
             browser_thread.start()
+        agent_base_url = None
+        if args.agent:
+            agent_host = args.host
+            if agent_host in ("", "0.0.0.0", "::", "[::]"):
+                agent_host = "127.0.0.1"
+            elif ":" in agent_host and not agent_host.startswith("["):
+                agent_host = f"[{agent_host}]"
+            agent_base_url = f"{httpsaffix}://{agent_host}:{displayedport}/v1"
 
         if args.hordekey and args.hordekey!="":
             if args.hordeworkername and args.hordeworkername!="":
@@ -17605,7 +17918,17 @@ def kcpp_main_process(launch_args, g_memory=None, gui_launcher=False):
         else:
             # Flush stdout for previous win32 issue so the client can see output.
             print(f"======\nPlease connect to custom endpoint at {endpoint_url}", flush=True)
-        asyncio.run(RunServerMultiThreaded(args.host, args.port, KcppServerRequestHandler))
+        on_server_ready = None
+        if agent_base_url:
+            def on_server_ready():
+                if args.mcpfile:
+                    agent_timer = threading.Timer(
+                        2, launch_kobold_agent_terminal, args=(agent_base_url, args.password)
+                    )
+                    agent_timer.start()
+                    return True
+                return launch_kobold_agent_terminal(agent_base_url, args.password)
+        asyncio.run(RunServerMultiThreaded(args.host, args.port, KcppServerRequestHandler, on_server_ready))
     else:
         # Flush stdout for previous win32 issue so the client can see output.
         if not args.prompt or args.benchmark or args.cli:
@@ -17648,6 +17971,7 @@ if __name__ == '__main__':
 
     #more advanced params
     advparser = parser.add_argument_group('Advanced Commands')
+    advparser.add_argument("--agent", help="Launches the simple KoboldCpp Agent in a new terminal window.", action='store_true')
     advparser.add_argument("--analyze", metavar=('[filename]'), help="Reads the metadata, weight types and tensor names in any GGUF or safetensors file.", default="")
     advparser.add_argument("--autofit","--fit","-fit", help="Forces autofit, which attempts to fit the model in the best possible way. Overrides everything else.", action='store_true')
     advparser.add_argument("--autofitpadding", metavar=('[padding in MB]'), help="How much spare allowance in MB should autofit reserve? If it's too little, the load might fail.", type=int, default=default_autofit_padding)
@@ -17767,7 +18091,7 @@ if __name__ == '__main__':
     sdparsergroup.add_argument("--sdoffloadcpu", help="Offload image weights in RAM to save VRAM, swap into VRAM when needed.", action='store_true')
     sdparsergroup.add_argument("--sdphotomaker", metavar=('[filename]'), help="PhotoMaker is a model that allows face cloning. Specify a PhotoMaker safetensors model which will be applied replacing img2img. SDXL models only. Leave blank if unused.", default="")
     sdparsergrouplora.add_argument("--sdquant",  metavar=('[quantization level 0/1/2]'), help="If specified, loads the model quantized to save memory. 0=off, 1=q8, 2=q4", type=int, choices=[0,1,2], nargs="?", const=2, default=0)
-    sdparsergroup.add_argument("--sdt5xxl", metavar=('[filename]'), help="Specify a T5-XXL safetensors model. Leave blank if prebaked or unused.", default="")
+    sdparsergroup.add_argument("--sdllm", metavar=('[filename]'), help="Specify an image generation text encoder or LLM (.safetensors or .gguf). Leave blank if prebaked or unused.", default="")
     sdparsergroup.add_argument("--sdthreads", metavar=('[threads]'), help="Use a different number of threads for image generation if specified. Otherwise, has the same value as --threads.", type=int, default=0)
     sdparsergroup.add_argument("--sdtiledvae", metavar=('[maxres]'), help="Adjust the automatic VAE tiling trigger for images above this size. 0 disables vae tiling.", type=int, default=default_vae_tile_threshold)
     sdparsergroup.add_argument("--sdupscaler", metavar=('[filename]'), help="You can use ESRGAN as an upscaling model to resize images. Leave blank if unused.", default="")
@@ -17820,6 +18144,7 @@ if __name__ == '__main__':
     admingroup.add_argument("--routermode", help="Router mode uses a reverse proxy router, allowing you to easily hotswap models and configs within a single request. Requires admin mode.", action='store_true')
     admingroup.add_argument("--reqtimeout", metavar=('[seconds]'), help="Timeout in seconds for HTTP requests.", type=int, default=default_reqtimeout)
     admingroup.add_argument("--autoswapmode", help="Autoswap mode builds on router mode to allow switching of model types within the same config automatically. Requires admin mode and router mode. All models desired must be defined within the same config.", action='store_true')
+    admingroup.add_argument("--autoswapthreshold", help=f"Keep model families at or below this combined file size resident in autoswap mode, in MB (default {default_autoswap_threshold}). Only one model family above the threshold is loaded at a time.", type=check_range(int,0,1048576), default=default_autoswap_threshold)
     admingroup.add_argument("--baseconfig", help="Specify a base .kcpps config to apply, if no custom base config is selected during a model swap", default="")
 
     autoswapgroup = parser.add_argument_group('Autoswap Options (Admin Mode)')
@@ -17848,6 +18173,7 @@ if __name__ == '__main__':
     deprecatedgroup.add_argument("--nopipelineparallel", help=argparse.SUPPRESS, action='store_true') #now to automatically enable when ubatch < batchsize and multigpu
     deprecatedgroup.add_argument("--pipelineparallel", help=argparse.SUPPRESS, action='store_true') #changed to nopipelineparallel
     deprecatedgroup.add_argument("--sdnotile", help=argparse.SUPPRESS, action='store_true') # legacy option, see sdtiledvae
+    deprecatedgroup.add_argument("--sdt5xxl", help=argparse.SUPPRESS, metavar=('[filename]')) # legacy option, see sdllm
     deprecatedgroup.add_argument("--sdvaecpu", help=argparse.SUPPRESS, action='store_true') # legacy option, see sdvaedevice
     deprecatedgroup.add_argument("--sdclipgpu", help=argparse.SUPPRESS, action='store_true') # legacy option, see sdclipgpu
     deprecatedgroup.add_argument("--forceversion", help=argparse.SUPPRESS, action='store_true') #no longer used
@@ -17855,7 +18181,10 @@ if __name__ == '__main__':
     deprecatedgroup.add_argument("--flashattention","--flash-attn","-fa", help=argparse.SUPPRESS, action='store_true') #flash attention now default on
     deprecatedgroup.add_argument("--useswa", help=argparse.SUPPRESS, action='store_true')
 
-    debuggroup = parser.add_argument_group('Debug Commands')
-    debuggroup.add_argument("--testmemory", help=argparse.SUPPRESS, action='store_true')
+    internalgroup = parser.add_argument_group('Internal Commands')
+    internalgroup.add_argument("--testmemory", help=argparse.SUPPRESS, action='store_true')
+    internalgroup.add_argument("--run-bundled-agent", "--run-agent", dest="run_bundled_agent", help=argparse.SUPPRESS, action='store_true')
+    internalgroup.add_argument("--agent-base-url", help=argparse.SUPPRESS, default=None)
+    internalgroup.add_argument("--agent-api-key", help=argparse.SUPPRESS, default=None)
 
     main(launch_args=parser.parse_args(),default_args=parser.parse_args([]))
