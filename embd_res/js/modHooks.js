@@ -55,6 +55,7 @@ class EsoExtensionType {
     
     static QUICK_START = new EsoExtensionType("QUICK_START");
     static SETTINGS = new EsoExtensionType("SETTINGS");
+    static GUIDE = new EsoExtensionType("GUIDE");
 }
 
 /*
@@ -62,6 +63,7 @@ class EsoExtensionType {
  * EsoExtension is the base class for all extensions.
  * QuickStartExtension extends EsoExtension for Quick Start specific extensions.
  * SettingsExtension extends EsoExtension for a mod's own tab in the settings dialog.
+ * GuideExtension extends EsoExtension for a mod's own tab in the guide.
  * 
  * @type {EsoExtension}
  */
@@ -198,6 +200,30 @@ class SettingsExtension extends EsoExtension {
 
     save() {
         return this.invokeIfPresent("_save")
+    }
+}
+
+/*
+ * Adds a tab to the guide (top bar "Guide", see esoGuide.js for the chapter format).
+ * chapters is an array of chapters, or a function returning one (called each time the tab is shown).
+ */
+class GuideExtension extends EsoExtension {
+    label = null
+    _chapters = null
+
+    constructor(id, label = null, chapters = null) {
+        super(id, EsoExtensionType.GUIDE)
+        this.label = label
+        this._chapters = chapters
+    }
+
+    getLabel() {
+        return this.label || this.id
+    }
+
+    getChapters() {
+        let chapters = typeof this._chapters === "function" ? this.invokeIfPresent("_chapters") : this._chapters
+        return Array.isArray(chapters) ? chapters : []
     }
 }
 
