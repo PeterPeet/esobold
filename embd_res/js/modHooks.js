@@ -54,12 +54,14 @@ class EsoExtensionType {
     }
     
     static QUICK_START = new EsoExtensionType("QUICK_START");
+    static SETTINGS = new EsoExtensionType("SETTINGS");
 }
 
 /*
  * EsoExtension and QuickStartExtension classes
  * EsoExtension is the base class for all extensions.
  * QuickStartExtension extends EsoExtension for Quick Start specific extensions.
+ * SettingsExtension extends EsoExtension for a mod's own tab in the settings dialog.
  * 
  * @type {EsoExtension}
  */
@@ -157,6 +159,45 @@ class QuickStartExtension extends EsoExtension {
 
     clear() {
         return this.invokeIfPresent("_clear")
+    }
+}
+
+/*
+ * Adds a tab to the settings dialog.
+ * render(containerElem, ui) is called once when the tab is built. ui holds the helpers Esobold uses for its own settings
+ * (ui.subSection, ui.bool, ui.range, ui.select, ui.text, ui.textArea, ui.button), so a mod's page looks like the rest of
+ * the dialog. Note that their labelTitle and labelText are inserted as HTML.
+ * load() is called each time the dialog opens (fill the inputs from localsettings), save() when it is confirmed (write
+ * localsettings back); Cancel calls neither.
+ */
+class SettingsExtension extends EsoExtension {
+    label = null
+    _render = null
+    _load = null
+    _save = null
+
+    constructor(id, label = null, render = null, load = null, save = null) {
+        super(id, EsoExtensionType.SETTINGS)
+        this.label = label
+        this._render = render
+        this._load = load
+        this._save = save
+    }
+
+    getLabel() {
+        return this.label || this.id
+    }
+
+    render(containerElem, ui) {
+        return this.invokeIfPresent("_render", containerElem, ui)
+    }
+
+    load() {
+        return this.invokeIfPresent("_load")
+    }
+
+    save() {
+        return this.invokeIfPresent("_save")
     }
 }
 
