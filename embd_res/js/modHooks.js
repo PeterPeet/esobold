@@ -97,7 +97,16 @@ class EsoExtension {
     invokeIfPresent(methodName, ...args) {
         try {
             if (typeof this[methodName] === "function") {
-                return this[methodName](...args)
+                let result = this[methodName](...args)
+                // Async hooks: a rejected promise is not caught by the try/catch, so collect it here
+                if (result && typeof result.then === "function") {
+                    return result.catch(e => {
+                        console.error(e)
+                        this.errors.push(e)
+                        return null
+                    })
+                }
+                return result
             }
         }
         catch (e) {
