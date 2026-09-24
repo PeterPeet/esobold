@@ -960,6 +960,7 @@ let clearQuickStartSelectionForRole = (role) => {
 
 let clearAllQuickStartSelections = () => {
     Object.keys(QUICK_START_SELECTION_CONFIG).forEach(role => clearQuickStartSelectionForRole(role))
+    window.eso.extensions.getByType(EsoExtensionType.QUICK_START).forEach(ext => ext.clear())
 }
 
 let toggleQuickStartSelectionForRole = (role, name) => {
@@ -989,6 +990,7 @@ let toggleQuickStartSelectionForRole = (role, name) => {
 
 let doesQuickStartHaveSelections = () => {
     return Object.keys(QUICK_START_SELECTION_CONFIG).some(role => getQuickStartSelectionForRole(role).length > 0)
+        || window.eso.extensions.getByType(EsoExtensionType.QUICK_START).some(ext => ext.hasSelection())
 }
 
 let loadWorldInfoFromLibraryByName = async (name) => {
@@ -1117,6 +1119,15 @@ let applyQuickStartSelection = async () => {
             }
             catch (e) {
                 console.error(e)
+            }
+        }
+
+        let quickStartExtensions = window.eso.extensions.getByType(EsoExtensionType.QUICK_START).filter(ext => ext.hasSelection())
+        for (let ext of quickStartExtensions) {
+            ext.clearErrors();
+            await ext.apply();
+            if (ext.getErrors().length > 0) {
+                nonFatalErrors.push(...ext.getErrors().map(e => `${ext.getLabel() || ext.getId()}: ${e?.message || e}`))
             }
         }
     }
@@ -1269,6 +1280,7 @@ let showQuickStartPopup = () => {
     let totalSelected = Object.keys(QUICK_START_SELECTION_CONFIG)
         .map(role => getQuickStartSelectionForRole(role).length)
         .reduce((sum, count) => sum + count, 0)
+        + window.eso.extensions.getByType(EsoExtensionType.QUICK_START).filter(ext => ext.hasSelection()).length
 
     createSection(contents, "Note", "Selections are optional. Use Library to select / deselect items. You can import from Library and then return here.")
     createSection(contents, "Selected items", `${totalSelected}`)
@@ -1277,6 +1289,24 @@ let showQuickStartPopup = () => {
     addChooserSection("additionalCharacters", "Additional characters in scene")
     addChooserSection("playerCharacter", "Player character")
     addChooserSection("worldInfo", "World info / lorebook entries")
+
+    
+    window.eso.extensions.getByType(EsoExtensionType.QUICK_START).forEach(ext => {
+        let sectionWrap = document.createElement("div")
+        sectionWrap.style.width = "100%"
+        sectionWrap.style.display = "flex"
+        sectionWrap.style.flexDirection = "column"
+        sectionWrap.style.gap = "8px"
+        sectionWrap.dataset.quickStartExtension = ext.id
+        try {
+            ext.render(sectionWrap, showQuickStartPopup)
+        }
+        catch (e) {
+            console.error(e)
+            return
+        }
+        createQuickStartSection(ext.label || ext.id, ext.helpText || "", sectionWrap)
+    })
 
     popupUtils.reset().title("Quick Start").content(contents).css("min-height", "50%").css("min-width", "60%")
         .button("Confirm", async () => {
