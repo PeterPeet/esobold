@@ -52,10 +52,10 @@ let ESO_GUIDE_CHAPTERS = [
             { p: "Settings → General → Usage mode decides how the AI answers:" },
             { table: [
                 ["Mode", "Use it for"],
-                ["Instruct", "Giving the AI tasks or questions, like an assistant."],
+                ["Instruct", "Giving the AI tasks or questions, like an assistant. Generally, this mode can also be used for chatting with a character - especially if models focus on instruction following (which is many modern models)."],
                 ["Chat", "Talking with a character."],
                 ["Adventure", "Text adventures: you describe actions, the AI tells what happens."],
-                ["Story", "Writing a story together; the AI continues your text."],
+                ["Story", "Writing a story together; the AI acts as your cowriter, continuing your text in a freeform way."],
             ] },
             { p: "Type into the box at the bottom and press Submit. Undo removes the last step, Redo brings it back and Retry asks for a new answer. Tick Allow Editing to change the story text directly." },
         ],
@@ -70,7 +70,7 @@ let ESO_GUIDE_CHAPTERS = [
         blocks: [
             { p: "The Library keeps your characters, saves and lorebooks in the browser, and on the server when Esobold stores data there (Server saves)." },
             { list: [
-                "Import character cards (PNG or JSON) and lorebooks, or create a new character.",
+                "Import character cards (PNG or JSON), lorebooks, saves and even certain document types. You can also download characters from third party sources, or create a new character yourself!",
                 "Hover over Library for shortcuts: Q.Save (quick save), Download, Load, New Character and Share.",
                 "Items in the Library can be picked in Quick Start.",
             ] },
@@ -101,9 +101,9 @@ let ESO_GUIDE_CHAPTERS = [
         blocks: [
             { p: "The Context button opens what the AI knows besides the story itself:" },
             { list: [
-                "Memory: text that is always sent, such as a summary or the setting.",
-                "World Info: entries that are added when their keywords appear. Groups can be exported and imported as files.",
-                "TextDB: documents the AI can search. Upload text, lorebooks or PDFs; with KoboldCpp, embeddings improve the search.",
+                "Memory: text that is always sent, such as a summary or the setting. This is one of the first things the AI always sees.",
+                "World Info: entries that are added when their keywords appear. Groups can be exported and imported as files. Similar to Lorebooks.",
+                "TextDB: documents the AI can search. Upload text, lorebooks or PDFs; with optional embedding support to improve the search.",
             ] },
             { p: "The context usage bar next to the connection status shows how full the AI's context is. Click it for details." },
         ],
@@ -117,7 +117,7 @@ let ESO_GUIDE_CHAPTERS = [
         blocks: [
             { p: "Every reply is recorded in the world tree. When you retry or edit, the story branches; the tree keeps all branches." },
             { p: "Open the tree with the tree icon in the top bar and click a point to load the story from there." },
-            { tip: "Settings → Esobold → World tree settings: prune branches, choose how deep branches are shown, or show the whole tree (only for small saves)." },
+            { tip: "Settings → Esobold → World tree settings: prune branches, choose how many levels of branches are shown, or show the whole tree (occasionally may have issues on very large saves)." },
         ],
         show: [
             { label: "Tree icon", run: (ctx) => ctx.highlight("#openTreeDiagram", "Opens the world tree") },
@@ -131,6 +131,7 @@ let ESO_GUIDE_CHAPTERS = [
                 "Turn it on under Settings → Agent.",
                 "It needs an instruct model with separate start and end tags for all roles (for example ChatML).",
                 "Tools such as web search, image generation or TTS must be set up and enabled first.",
+                "This mode works well with Esobold (or KoboldCPP)'s Autoswap, allowing the AI to switch model types and tools seamlessly during its multi-step reasoning.",
             ] },
         ],
         show: [
@@ -146,7 +147,7 @@ let ESO_GUIDE_CHAPTERS = [
                 "Context settings: \"Turns max content\" and \"Turns old content ratio\" create a sliding window of turns. It helps large models with slow prompt processing.",
                 "Mods: open the third-party mods manager.",
             ] },
-            { p: "Settings → GUI has the theme colours, the context usage bar and the editor options." },
+            { p: "Settings → GUI has options to customise the theme colours and font sizes, along with context usage bar and editor options." },
         ],
         show: [
             { label: "Open Settings → Esobold", run: (ctx) => ctx.openSettings("esobold") },
@@ -223,7 +224,6 @@ class EsoGuide {
     }
 
     render() {
-        this.ensureStyles()
         let tabs = this.getTabs()
         let tab = tabs.find(curr => curr.id === this.position.tab) || tabs[0]
         let chapterIndex = Math.max(0, tab.chapters.findIndex(curr => curr.id === this.position.chapters[tab.id]))
@@ -503,38 +503,6 @@ class EsoGuide {
             this.hiddenForSpotlight = false
             document.getElementById(this.containerId)?.classList.remove("hidden")
         }
-    }
-
-    ensureStyles() {
-        if (document.getElementById("esoGuideStyles")) {
-            return
-        }
-        let style = document.createElement("style")
-        style.id = "esoGuideStyles"
-        style.textContent = `
-            #esoGuideContainer .esoGuideBody { text-align: left; }
-            .esoGuideLayout { display: flex; gap: 14px; padding: 8px 10px; min-height: 100%; box-sizing: border-box; }
-            .esoGuideToc { flex: 0 0 200px; display: flex; flex-direction: column; gap: 2px; padding-right: 10px; border-right: 1px solid var(--theme_color_border); }
-            .esoGuideToc button { text-align: left; background: none; border: none; border-radius: 6px; padding: 5px 8px; color: var(--theme_color_fg); }
-            .esoGuideToc button:hover { background-color: var(--theme_color_accent_bg); }
-            .esoGuideToc button[aria-current] { background-color: var(--theme_color_accent_bg_highlight); color: var(--theme_color_accent_fg_highlight); }
-            .esoGuideArticle { flex: 1; min-width: 0; color: var(--theme_color_fg); }
-            .esoGuideArticle h3 { margin-top: 2px; }
-            .esoGuideArticle p, .esoGuideArticle ul, .esoGuideTable, .esoGuideTip { margin: 0 0 10px 0; }
-            .esoGuideArticle ul { padding-left: 20px; }
-            .esoGuideMuted { color: var(--theme_color_fg_muted); font-size: var(--theme_font_size_small); margin: 6px 0 4px 0; }
-            .esoGuideTip { padding: 6px 10px; border-left: 3px solid var(--theme_color_border_highlight); background-color: var(--theme_color_accent_bg); }
-            .esoGuideTable { border-collapse: collapse; width: 100%; }
-            .esoGuideTable th, .esoGuideTable td { border: 1px solid var(--theme_color_border); padding: 4px 6px; text-align: left; vertical-align: top; }
-            .esoGuideRow { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-bottom: 10px; }
-            .esoGuideChapterNav { margin-top: 16px; }
-            .esoGuideRing { position: fixed; z-index: 100000; pointer-events: none; border: 3px solid var(--theme_color_border_highlight); border-radius: 8px; box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.45); }
-            .esoGuideNote { position: fixed; z-index: 100001; max-width: 280px; padding: 8px 12px; border-radius: 8px; border: 2px solid var(--theme_color_border_highlight); background-color: var(--theme_color_bg_popups); color: var(--theme_color_fg); box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4); }
-            @media (max-width: 700px) {
-                .esoGuideLayout { flex-direction: column; }
-                .esoGuideToc { flex: none; flex-direction: row; flex-wrap: wrap; border-right: none; border-bottom: 1px solid var(--theme_color_border); padding: 0 0 8px 0; }
-            }`
-        document.head.appendChild(style)
     }
 }
 
