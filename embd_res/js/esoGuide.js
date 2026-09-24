@@ -422,7 +422,11 @@ class EsoGuide {
                     display_settings_tab([...tab.parentElement.children].indexOf(tab))
                 }
             },
-            navLink: (text) => () => [...document.querySelectorAll("#navbarNavDropdown a.nav-link")].find(link => link.textContent.trim() === text),
+            // Several top bar links can share a text (e.g. the hidden legacy "Quick Start"), so prefer a visible one
+            navLink: (text) => () => {
+                let links = [...document.querySelectorAll("#navbarNavDropdown a.nav-link")].filter(link => link.textContent.trim() === text)
+                return links.find(link => link.getClientRects().length > 0) || links[0]
+            },
         }
     }
 
